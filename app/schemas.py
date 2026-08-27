@@ -75,6 +75,18 @@ class ProfileRequest(BaseModel):
     url: str
 
 
+class ProfileUrlMatch(BaseModel):
+    public_identifier: str
+    profile_url: str
+    matched_query: str
+    fetched_at: str
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: Optional[str] = None
+    alert: Optional[str] = Field(
+        default=None,
+        description="Present when the failure is a known, documented limitation "
+        "(see README) rather than an unexpected error.",
+    )

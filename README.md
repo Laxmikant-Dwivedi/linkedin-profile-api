@@ -4,7 +4,9 @@ A hosted HTTPS API that accepts a LinkedIn profile URL and returns structured
 JSON (name, headline, location, about, experience, education, skills,
 certifications, languages, profile images) — built by reverse-engineering
 LinkedIn's internal "Voyager" REST API, the same one linkedin.com's own
-frontend calls.
+frontend calls. Also includes a second endpoint to find a profile URL from a
+name plus company/email, mirroring PhantomBuster's separate "Profile
+Scraper" and "Profile URL Finder" tools in one service.
 
 > **Unofficial.** This talks to an undocumented, private API that LinkedIn
 > can change or block at any time, and doing so is against LinkedIn's User
@@ -137,7 +139,18 @@ Response `200`:
 }
 ```
 
-Error responses are `{"error": "<message>"}` with an appropriate status code:
+Error responses are `{"error": "<message>"}` with an appropriate status code.
+When the failure is one of the known, documented limitations below (bot
+detection, a capture timeout, an expired session) rather than a genuine bug,
+the body also includes an `alert` field spelling that out in plain language,
+e.g.:
+
+```json
+{
+  "error": "LinkedIn blocked the automated request: ...",
+  "alert": "Known limitation: LinkedIn's automation detection can bounce a headless-browser request into a redirect loop instead of serving the page. This is not a bug in this service — see README 'Known limitations' ..."
+}
+```
 
 | Status | Meaning |
 |---|---|
@@ -145,7 +158,44 @@ Error responses are `{"error": "<message>"}` with an appropriate status code:
 | 401 | Missing/invalid `X-API-Key` |
 | 404 | LinkedIn returned "not found" for that profile |
 | 429 | Per-key rate limit exceeded, or LinkedIn itself rate-limited us |
-| 502 | LinkedIn session invalid/expired, or an unexpected upstream failure |
+| 502 | LinkedIn session invalid/expired, bot detection triggered, a capture timeout, or an unexpected upstream failure — check for an `alert` field first |
+
+### `GET /api/v1/find-profile-url?name=<full name>&company=<company>|&email=<email>`
+
+Headers: `X-API-Key: <your configured key>`
+
+Finds a LinkedIn profile URL from a name plus a company or email — mirrors
+PhantomBuster's "LinkedIn Profile URL Finder". A name alone matches too many
+people to be useful, so `company` or `email` is required to disambiguate
+(the same constraint that tool documents); omitting both returns a `400`.
+
+```bash
+curl -H "X-API-Key: $API_KEY" \
+  "https://your-deployment.example.com/api/v1/find-profile-url?name=Jane+Doe&company=Example+Corp"
+```
+
+Response `200`:
+
+```json
+{
+  "public_identifier": "jane-doe-1234",
+  "profile_url": "https://www.linkedin.com/in/jane-doe-1234/",
+  "matched_query": "Jane Doe · Example Corp",
+  "fetched_at": "2026-08-28T10:15:00+00:00"
+}
+```
+
+Implemented by navigating LinkedIn's people-search results page and reading
+`href="...linkedin.com/in/..."` links straight out of the rendered DOM,
+rather than intercepting LinkedIn's internal search API response — the
+`/in/` URL pattern in a result link is far more stable across LinkedIn
+frontend changes than that endpoint's internal JSON schema (the tradeoff
+`app/parser.py`'s docstring describes for `profileView`, resolved the other
+way here since we only need a URL out of it, not full structured data).
+`404` means no matching link was found on the results page; a `502` with an
+`alert` means the search hit the same bot-detection/timeout class of issue
+documented for `/api/v1/profile` — see
+[Known limitations](#known-limitations).
 
 ### `GET /health`
 
@@ -153,7 +203,8 @@ No auth required. Returns `{"status": "ok", "linkedin_session_configured": true|
 useful as a deployment platform's health check, and to confirm cookies were
 set correctly without spending a LinkedIn request.
 
-Interactive docs (Swagger UI) are auto-served at `/docs` once running.
+Interactive docs (Swagger UI) are auto-served at `/docs`. A landing page at
+`/` offers a live try-it-now form for `/api/v1/profile` in the browser.
 
 ## Setup
 
@@ -298,3 +349,13 @@ you HTTPS automatically):
   clean JSON error instead of an opaque empty response when this happens —
   but the real fix, if this needs to work reliably in production, is more
   CPU (a paid instance tier), not a longer timeout.
+- **`/api/v1/find-profile-url` inherits every limitation above** (it uses
+  the same browser/session machinery) plus two of its own: LinkedIn caps
+  people-search results for non-Premium accounts (its "commercial use
+  limit"), after which it serves a blurred/limited results page instead of
+  real ones — this looks identical to a genuine no-match (`404`) from the
+  outside, there's no reliable way to tell them apart from the response
+  alone. It also just returns the *first* DOM match for the query, with no
+  confidence score or disambiguation beyond what `company`/`email` narrowed
+  the search to — for a common name at a large company, that first result
+  isn't guaranteed to be the right person.

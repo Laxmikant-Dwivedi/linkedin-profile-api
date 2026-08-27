@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LinkedIn Profile API</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --bg-elevated: #111827;
+    --card: #161d2b;
+    --border: #26304a;
+    --text: #e7ebf3;
+    --text-dim: #9aa4bb;
+    --accent: #4f7fff;
+    --accent-2: #7c5cff;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --err: #f87171;
+    --radius: 14px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 15% -10%, rgba(79,127,255,0.18), transparent 60%),
+      radial-gradient(1000px 500px at 100% 0%, rgba(124,92,255,0.14), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 56px 24px 80px;
+  }
+
+  header { margin-bottom: 40px; }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    padding: 5px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    color: var(--text-dim);
+  }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); }
+  .badge.ok .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .badge.bad .dot { background: var(--err); box-shadow: 0 0 8px var(--err); }
+  .badge.pending .dot { background: var(--warn); }
+
+  h1 {
+    font-size: 34px;
+    margin: 16px 0 8px;
+    background: linear-gradient(90deg, #fff, #c9d3ff 60%, var(--accent-2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    letter-spacing: -0.01em;
+  }
+
+  .lede { color: var(--text-dim); font-size: 16px; max-width: 60ch; }
+  .lede a { color: var(--accent); text-decoration: none; }
+  .lede a:hover { text-decoration: underline; }
+
+  .card {
+    background: linear-gradient(180deg, var(--card), var(--bg-elevated));
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    box-shadow: 0 20px 60px -30px rgba(0,0,0,0.6);
+  }
+
+  .card + .card { margin-top: 24px; }
+
+  label { display: block; font-size: 13px; font-weight: 600; color: var(--text-dim); margin-bottom: 6px; }
+  .field { margin-bottom: 16px; }
+  input[type="text"], input[type="password"] {
+    width: 100%;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: #0d1320;
+    color: var(--text);
+    font-size: 14.5px;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,127,255,0.18); }
+  input::placeholder { color: #5b6480; }
+
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row .field { flex: 1; min-width: 220px; }
+
+  button {
+    appearance: none;
+    border: none;
+    cursor: pointer;
+    font-weight: 650;
+    font-size: 14.5px;
+    padding: 12px 20px;
+    border-radius: 10px;
+    color: white;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: 0 8px 24px -8px rgba(79,127,255,0.55);
+    transition: transform 0.1s, box-shadow 0.15s, opacity 0.15s;
+  }
+  button:hover { transform: translateY(-1px); box-shadow: 0 10px 28px -8px rgba(79,127,255,0.7); }
+  button:active { transform: translateY(0); }
+  button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; box-shadow: none; }
+
+  .hint { font-size: 12.5px; color: var(--text-dim); margin-top: 10px; }
+  .hint code { background: #0d1320; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--border); }
+
+  #result { margin-top: 24px; }
+
+  .spinner {
+    width: 18px; height: 18px;
+    border: 2.5px solid rgba(255,255,255,0.35);
+    border-top-color: white;
+    border-radius: 50%;
+    display: inline-block;
+    animation: spin 0.7s linear infinite;
+    vertical-align: -3px;
+    margin-right: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .alert {
+    border-radius: 12px;
+    padding: 16px 18px;
+    font-size: 14px;
+    border: 1px solid;
+    margin-bottom: 16px;
+  }
+  .alert.warn { background: rgba(251,191,36,0.08); border-color: rgba(251,191,36,0.35); color: #fde68a; }
+  .alert.err { background: rgba(248,113,113,0.08); border-color: rgba(248,113,113,0.35); color: #fecaca; }
+  .alert .alert-title { font-weight: 700; margin-bottom: 4px; display: block; }
+
+  .profile {
+    display: flex;
+    gap: 18px;
+    align-items: flex-start;
+  }
+  .profile img {
+    width: 84px; height: 84px; border-radius: 50%;
+    object-fit: cover;
+    border: 2px solid var(--border);
+    flex-shrink: 0;
+  }
+  .profile .avatar-fallback {
+    width: 84px; height: 84px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 30px; font-weight: 700; flex-shrink: 0;
+  }
+  .profile h2 { margin: 0 0 4px; font-size: 22px; }
+  .profile .headline { color: var(--text-dim); font-size: 14.5px; margin-bottom: 2px; }
+  .profile .location { color: var(--text-dim); font-size: 13px; }
+
+  .section-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin: 22px 0 10px;
+  }
+
+  .about { font-size: 14px; color: #cdd4e6; white-space: pre-wrap; }
+
+  .exp-item, .edu-item, .cert-item {
+    padding: 12px 0;
+    border-top: 1px solid var(--border);
+  }
+  .exp-item:first-child, .edu-item:first-child, .cert-item:first-child { border-top: none; }
+  .exp-title { font-weight: 650; font-size: 14.5px; }
+  .exp-sub { color: var(--text-dim); font-size: 13px; margin-top: 2px; }
+  .exp-dates { color: #6b7593; font-size: 12px; margin-top: 2px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    background: #0d1320;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-size: 12.5px;
+    color: #cdd4e6;
+  }
+  .chip b { color: var(--text); }
+
+  details { margin-top: 20px; }
+  summary {
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-dim);
+    user-select: none;
+  }
+  pre {
+    margin-top: 10px;
+    background: #0a0e17;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    overflow-x: auto;
+    font-size: 12.5px;
+    color: #b9c2db;
+  }
+
+  footer {
+    margin-top: 40px;
+    color: var(--text-dim);
+    font-size: 13px;
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+
+  .tabs { display: flex; gap: 6px; margin-bottom: 20px; }
+  .tab-btn {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    box-shadow: none;
+    font-size: 13.5px;
+    font-weight: 600;
+    padding: 9px 16px;
+    border-radius: 999px;
+  }
+  .tab-btn:hover { transform: none; box-shadow: none; color: var(--text); }
+  .tab-btn.active {
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: white;
+    border-color: transparent;
+  }
+  .hidden { display: none; }
+  .found-url-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap;
+  }
+  .found-url {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13.5px;
+    color: var(--ok);
+    word-break: break-all;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <span class="badge pending" id="health-badge"><span class="dot"></span><span id="health-text">Checking session…</span></span>
+      <h1>LinkedIn Profile API</h1>
+      <p class="lede">
+        Accepts a LinkedIn profile URL and returns structured JSON — name, headline,
+        location, about, experience, education, skills, certifications, languages,
+        and profile images. Built by reverse-engineering LinkedIn's internal Voyager
+        API. See <a href="/docs">/docs</a> for the full API reference.
+      </p>
+    </header>
+
+    <div class="card">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="fetch" type="button">Fetch profile by URL</button>
+        <button class="tab-btn" data-tab="find" type="button">Find profile URL by name</button>
+      </div>
+
+      <div class="tab-panel" id="tab-fetch">
+        <div class="field">
+          <label for="url">LinkedIn profile URL</label>
+          <input type="text" id="url" placeholder="https://www.linkedin.com/in/someone/" />
+        </div>
+      </div>
+
+      <div class="tab-panel hidden" id="tab-find">
+        <div class="row">
+          <div class="field">
+            <label for="findName">Full name</label>
+            <input type="text" id="findName" placeholder="Jane Doe" />
+          </div>
+          <div class="field">
+            <label for="findCompany">Company</label>
+            <input type="text" id="findCompany" placeholder="Example Corp" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="findEmail">…or professional email (instead of company)</label>
+          <input type="text" id="findEmail" placeholder="jane@example.com" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="apiKey">X-API-Key</label>
+        <input type="password" id="apiKey" placeholder="your API key" />
+      </div>
+
+      <button id="actionBtn">Fetch profile</button>
+      <div class="hint" id="actionHint">
+        Calls <code>GET /api/v1/profile</code> directly from your browser. Your API key
+        is only sent to this API, never stored.
+      </div>
+    </div>
+
+    <div id="result"></div>
+
+    <footer>
+      <a href="/docs">API docs (Swagger)</a>
+      <a href="https://github.com/Laxmikant-Dwivedi/linkedin-profile-api">Source on GitHub</a>
+      <a href="https://github.com/Laxmikant-Dwivedi/linkedin-profile-api#known-limitations">Known limitations</a>
+    </footer>
+  </div>
+
+<script>
+  const healthBadge = document.getElementById('health-badge');
+  const healthText = document.getElementById('health-text');
+
+  fetch('/health')
+    .then(r => r.json())
+    .then(d => {
+      if (d.linkedin_session_configured) {
+        healthBadge.className = 'badge ok';
+        healthText.textContent = 'LinkedIn session configured';
+      } else {
+        healthBadge.className = 'badge bad';
+        healthText.textContent = 'No LinkedIn session configured';
+      }
+    })
+    .catch(() => {
+      healthBadge.className = 'badge bad';
+      healthText.textContent = 'API unreachable';
+    });
+
+  const btn = document.getElementById('actionBtn');
+  const hintEl = document.getElementById('actionHint');
+  const resultEl = document.getElementById('result');
+  const urlInput = document.getElementById('url');
+  const keyInput = document.getElementById('apiKey');
+  const findNameInput = document.getElementById('findName');
+  const findCompanyInput = document.getElementById('findCompany');
+  const findEmailInput = document.getElementById('findEmail');
+
+  let activeTab = 'fetch';
+  const TAB_CONFIG = {
+    fetch: {
+      label: 'Fetch profile',
+      hint: 'Calls <code>GET /api/v1/profile</code> directly from your browser. Your API key is only sent to this API, never stored.',
+    },
+    find: {
+      label: 'Find profile URL',
+      hint: 'Calls <code>GET /api/v1/find-profile-url</code>. Requires company or email to disambiguate the name.',
+    },
+  };
+
+  document.querySelectorAll('.tab-btn').forEach(tabBtn => {
+    tabBtn.addEventListener('click', () => {
+      activeTab = tabBtn.dataset.tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === tabBtn));
+      document.getElementById('tab-fetch').classList.toggle('hidden', activeTab !== 'fetch');
+      document.getElementById('tab-find').classList.toggle('hidden', activeTab !== 'find');
+      btn.textContent = TAB_CONFIG[activeTab].label;
+      hintEl.innerHTML = TAB_CONFIG[activeTab].hint;
+      resultEl.innerHTML = '';
+    });
+  });
+
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  function renderError(status, body) {
+    const alertMsg = body && body.alert;
+    const errorMsg = (body && (body.error || body.detail)) || `Request failed with status ${status}`;
+    let html = '';
+    if (alertMsg) {
+      html += `<div class="alert warn"><span class="alert-title">⚠ Known limitation (HTTP ${status})</span>${esc(alertMsg)}</div>`;
+    } else {
+      html += `<div class="alert err"><span class="alert-title">Error (HTTP ${status})</span>${esc(errorMsg)}</div>`;
+    }
+    if (alertMsg) {
+      html += `<div class="card"><div class="section-title">Raw error</div><pre>${esc(errorMsg)}</pre></div>`;
+    }
+    resultEl.innerHTML = html;
+  }
+
+  function initials(name) {
+    if (!name) return '?';
+    return name.split(' ').filter(Boolean).slice(0, 2).map(p => p[0].toUpperCase()).join('');
+  }
+
+  function renderProfile(p) {
+    const img = (p.profile_images && p.profile_images[0]) ? p.profile_images[0].url : null;
+    const avatar = img
+      ? `<img src="${esc(img)}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'), {className:'avatar-fallback', textContent:'${esc(initials(p.full_name))}'}))" />`
+      : `<div class="avatar-fallback">${esc(initials(p.full_name))}</div>`;
+
+    let html = `<div class="card">`;
+    html += `<div class="profile">${avatar}<div>
+      <h2>${esc(p.full_name)}</h2>
+      <div class="headline">${esc(p.headline || '')}</div>
+      <div class="location">${esc(p.location || '')}</div>
+    </div></div>`;
+
+    if (p.about) {
+      html += `<div class="section-title">About</div><div class="about">${esc(p.about)}</div>`;
+    }
+
+    if (p.experience && p.experience.length) {
+      html += `<div class="section-title">Experience</div>`;
+      html += p.experience.map(e => `
+        <div class="exp-item">
+          <div class="exp-title">${esc(e.title)}${e.company ? ' · ' + esc(e.company) : ''}</div>
+          <div class="exp-sub">${esc(e.location || '')}</div>
+          <div class="exp-dates">${esc(e.start_date || '')} – ${e.is_current ? 'Present' : esc(e.end_date || '')}</div>
+        </div>`).join('');
+    }
+
+    if (p.education && p.education.length) {
+      html += `<div class="section-title">Education</div>`;
+      html += p.education.map(e => `
+        <div class="edu-item">
+          <div class="exp-title">${esc(e.school)}</div>
+          <div class="exp-sub">${[e.degree, e.field_of_study].filter(Boolean).map(esc).join(', ')}</div>
+          <div class="exp-dates">${esc(e.start_date || '')} – ${esc(e.end_date || '')}</div>
+        </div>`).join('');
+    }
+
+    if (p.skills && p.skills.length) {
+      html += `<div class="section-title">Skills</div><div class="chips">`;
+      html += p.skills.map(s => `<div class="chip"><b>${esc(s.name)}</b>${s.endorsement_count ? ' · ' + s.endorsement_count : ''}</div>`).join('');
+      html += `</div>`;
+    }
+
+    if (p.certifications && p.certifications.length) {
+      html += `<div class="section-title">Certifications</div>`;
+      html += p.certifications.map(c => `
+        <div class="cert-item">
+          <div class="exp-title">${esc(c.name)}</div>
+          <div class="exp-sub">${esc(c.issuing_organization || '')}</div>
+        </div>`).join('');
+    }
+
+    if (p.languages && p.languages.length) {
+      html += `<div class="section-title">Languages</div><div class="chips">`;
+      html += p.languages.map(l => `<div class="chip"><b>${esc(l.name)}</b>${l.proficiency ? ' · ' + esc(l.proficiency) : ''}</div>`).join('');
+      html += `</div>`;
+    }
+
+    html += `<details><summary>View raw JSON</summary><pre>${esc(JSON.stringify(p, null, 2))}</pre></details>`;
+    html += `</div>`;
+    resultEl.innerHTML = html;
+  }
+
+  function renderFoundUrl(match) {
+    const html = `<div class="card">
+      <div class="section-title">Match found</div>
+      <div class="found-url-row">
+        <span class="found-url">${esc(match.profile_url)}</span>
+        <button id="useUrlBtn" type="button">Use this URL →</button>
+      </div>
+      <div class="hint" style="margin-top:12px;">Matched query: ${esc(match.matched_query)}</div>
+      <details><summary>View raw JSON</summary><pre>${esc(JSON.stringify(match, null, 2))}</pre></details>
+    </div>`;
+    resultEl.innerHTML = html;
+    document.getElementById('useUrlBtn').addEventListener('click', () => {
+      urlInput.value = match.profile_url;
+      document.querySelector('.tab-btn[data-tab="fetch"]').click();
+      run();
+    });
+  }
+
+  async function runFetch() {
+    const url = urlInput.value.trim();
+    const apiKey = keyInput.value.trim();
+    if (!url) { urlInput.focus(); return; }
+    if (!apiKey) { keyInput.focus(); return; }
+
+    btn.disabled = true;
+    resultEl.innerHTML = `<div class="card"><span class="spinner"></span>Fetching from LinkedIn — this can take 15-30s (headless browser render)…</div>`;
+
+    try {
+      const resp = await fetch(`/api/v1/profile?url=${encodeURIComponent(url)}`, {
+        headers: { 'X-API-Key': apiKey }
+      });
+      let body = null;
+      try { body = await resp.json(); } catch (_) {}
+      if (!resp.ok) {
+        renderError(resp.status, body);
+      } else {
+        renderProfile(body);
+      }
+    } catch (err) {
+      renderError(0, { error: String(err) });
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function runFind() {
+    const name = findNameInput.value.trim();
+    const company = findCompanyInput.value.trim();
+    const email = findEmailInput.value.trim();
+    const apiKey = keyInput.value.trim();
+    if (!name) { findNameInput.focus(); return; }
+    if (!company && !email) { findCompanyInput.focus(); return; }
+    if (!apiKey) { keyInput.focus(); return; }
+
+    btn.disabled = true;
+    resultEl.innerHTML = `<div class="card"><span class="spinner"></span>Searching LinkedIn — this can take 15-30s (headless browser render)…</div>`;
+
+    const params = new URLSearchParams({ name });
+    if (company) params.set('company', company);
+    if (email) params.set('email', email);
+
+    try {
+      const resp = await fetch(`/api/v1/find-profile-url?${params.toString()}`, {
+        headers: { 'X-API-Key': apiKey }
+      });
+      let body = null;
+      try { body = await resp.json(); } catch (_) {}
+      if (!resp.ok) {
+        renderError(resp.status, body);
+      } else {
+        renderFoundUrl(body);
+      }
+    } catch (err) {
+      renderError(0, { error: String(err) });
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function run() {
+    return activeTab === 'find' ? runFind() : runFetch();
+  }
+
+  btn.addEventListener('click', run);
+  [urlInput, keyInput, findNameInput, findCompanyInput, findEmailInput].forEach(el => el.addEventListener('keydown', e => {
+    if (e.key === 'Enter') run();
+  }));
+</script>
+</body>
+</html>

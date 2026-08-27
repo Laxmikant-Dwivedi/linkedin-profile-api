@@ -22,8 +22,10 @@ change at all.
 import asyncio
 import re
 import time
-from typing import Any, Dict, Optional
+import urllib.parse
+from typing import Any, Dict, List, Optional
 
+from playwright.async_api import BrowserContext, Error as PlaywrightError
 from playwright.async_api import Response, async_playwright
 
 from app.config import Settings
@@ -33,19 +35,46 @@ _PUBLIC_ID_RE = re.compile(r"linkedin\.com/in/([^/?#]+)", re.IGNORECASE)
 _PROFILE_VIEW_PATH = "/voyager/api/identity/profiles/"
 _LOGIN_WALL_MARKERS = ("/authwall", "/login", "/checkpoint/")
 
+_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+window.chrome = { runtime: {} };
+"""
+
 
 class LinkedInAuthError(Exception):
     """Raised when the configured session cookie is missing/expired."""
 
 
 class LinkedInProfileNotFound(Exception):
-    """Raised when the profile page never yields a profileView response
-    (private profile fully outside the viewer's network, deleted account,
-    typo'd URL, etc.)."""
+    """Raised when LinkedIn explicitly told us the profile doesn't exist
+    (a real 404 from the intercepted response)."""
 
 
 class LinkedInRateLimited(Exception):
     """Raised when LinkedIn responds with 429 to the intercepted request."""
+
+
+class LinkedInBotDetected(Exception):
+    """Raised when LinkedIn's automation detection visibly intervened —
+    e.g. bounced the navigation into a redirect loop — rather than serving
+    the page. A known, documented limitation; see README."""
+
+
+class LinkedInCaptureTimeout(Exception):
+    """Raised when the page loaded without any bot-detection signature, but
+    no `profileView` response ever arrived before our timeout. Ambiguous by
+    nature: could be a genuinely wrong public-id, or a CPU-starved host
+    that's simply too slow to finish rendering the page in time. See
+    README Known Limitations."""
+
+
+class LinkedInSearchNoMatch(Exception):
+    """Raised when a people-search returned no profile links at all —
+    genuinely no match, or LinkedIn served a blurred/limited results page
+    (its "commercial use limit" for non-Premium accounts) instead of real
+    results. See README Known Limitations."""
 
 
 def extract_public_identifier(profile_url: str) -> str:
@@ -106,13 +135,10 @@ class LinkedInClient:
             await self._playwright.stop()
             self._playwright = None
 
-    async def fetch_profile_view(self, public_identifier: str) -> Dict[str, Any]:
-        if not self._settings.is_configured:
-            raise LinkedInAuthError("LI_AT_COOKIE is not configured on the server.")
-
-        await self._rate_limiter.wait_turn()
-        await self._ensure_browser()
-
+    async def _new_stealth_context(self) -> BrowserContext:
+        """A fresh browser context with the li_at session and the standard
+        automation-fingerprint mitigations applied — shared by every
+        LinkedIn-facing operation (profile fetch, people search, ...)."""
         context = await self._browser.new_context(
             user_agent=self._settings.user_agent,
             viewport={"width": 1366, "height": 900},
@@ -124,14 +150,7 @@ class LinkedInClient:
         # obvious ones before any page script runs. This is a standard,
         # widely-used mitigation for automation fingerprinting, not an
         # attempt to defeat security controls.
-        await context.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            window.chrome = { runtime: {} };
-            """
-        )
+        await context.add_init_script(_STEALTH_INIT_SCRIPT)
         await context.add_cookies(
             [
                 {
@@ -144,6 +163,16 @@ class LinkedInClient:
                 }
             ]
         )
+        return context
+
+    async def fetch_profile_view(self, public_identifier: str) -> Dict[str, Any]:
+        if not self._settings.is_configured:
+            raise LinkedInAuthError("LI_AT_COOKIE is not configured on the server.")
+
+        await self._rate_limiter.wait_turn()
+        await self._ensure_browser()
+
+        context = await self._new_stealth_context()
 
         captured: Dict[str, Any] = {}
         response_seen = asyncio.Event()
@@ -164,11 +193,10 @@ class LinkedInClient:
 
         try:
             timeout_ms = self._settings.request_timeout_seconds * 1000
-            await page.goto(
-                f"https://www.linkedin.com/in/{public_identifier}/",
-                wait_until="domcontentloaded",
-                timeout=timeout_ms,
+            await self._goto_or_raise_bot_detected(
+                page, f"https://www.linkedin.com/in/{public_identifier}/", timeout_ms
             )
+
             try:
                 await asyncio.wait_for(
                     response_seen.wait(), timeout=self._settings.request_timeout_seconds
@@ -179,7 +207,7 @@ class LinkedInClient:
                         "LinkedIn redirected to a login/checkpoint page — "
                         "the li_at cookie is invalid, expired, or the account hit a security check."
                     )
-                raise LinkedInProfileNotFound(public_identifier)
+                raise LinkedInCaptureTimeout(public_identifier)
         finally:
             await page.close()
             await context.close()
@@ -194,3 +222,74 @@ class LinkedInClient:
         if "json" not in captured:
             raise LinkedInProfileNotFound(public_identifier)
         return captured["json"]
+
+    async def _goto_or_raise_bot_detected(self, page, url: str, timeout_ms: float) -> None:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except PlaywrightError as exc:
+            if "ERR_TOO_MANY_REDIRECTS" in str(exc):
+                raise LinkedInBotDetected(
+                    "LinkedIn's automation detection bounced this request into a "
+                    "security-challenge redirect loop before the page loaded."
+                ) from exc
+            raise
+
+    async def search_profile_url(
+        self, full_name: str, company: Optional[str] = None, email: Optional[str] = None
+    ) -> str:
+        """Searches LinkedIn's people search for `full_name` disambiguated by
+        `company` or `email`, and returns the first matching profile URL.
+
+        Mirrors PhantomBuster's "LinkedIn Profile URL Finder": too many
+        people share a name for name-only search to be useful, so a company
+        or email is required to narrow it down (same constraint that tool
+        documents). Implemented via DOM extraction (`a[href*="/in/"]`)
+        rather than intercepting LinkedIn's internal search API response,
+        since the search results DOM's href attributes are far more stable
+        across LinkedIn frontend changes than its internal search endpoint
+        schema — the same tradeoff documented for `fetch_profile_view`,
+        just resolved the other way here.
+        """
+        if not company and not email:
+            raise ValueError("Provide company or email to disambiguate the search.")
+        if not self._settings.is_configured:
+            raise LinkedInAuthError("LI_AT_COOKIE is not configured on the server.")
+
+        query = " ".join(part for part in [full_name, company or email] if part)
+        search_url = "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(query)
+
+        await self._rate_limiter.wait_turn()
+        await self._ensure_browser()
+
+        context = await self._new_stealth_context()
+        page = await context.new_page()
+
+        try:
+            timeout_ms = self._settings.request_timeout_seconds * 1000
+            await self._goto_or_raise_bot_detected(page, search_url, timeout_ms)
+
+            try:
+                await page.wait_for_selector('a[href*="/in/"]', timeout=timeout_ms)
+            except PlaywrightError:
+                if any(marker in page.url for marker in _LOGIN_WALL_MARKERS):
+                    raise LinkedInAuthError(
+                        "LinkedIn redirected to a login/checkpoint page — "
+                        "the li_at cookie is invalid, expired, or the account hit a security check."
+                    )
+                raise LinkedInSearchNoMatch(query)
+
+            hrefs: List[str] = await page.eval_on_selector_all(
+                'a[href*="/in/"]', "els => els.map(e => e.href)"
+            )
+        finally:
+            await page.close()
+            await context.close()
+
+        for href in hrefs:
+            try:
+                public_id = extract_public_identifier(href)
+            except ValueError:
+                continue
+            return f"https://www.linkedin.com/in/{public_id}/"
+
+        raise LinkedInSearchNoMatch(query)
