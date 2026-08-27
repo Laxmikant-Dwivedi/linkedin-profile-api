@@ -360,6 +360,21 @@ you HTTPS automatically):
   clean JSON error instead of an opaque empty response when this happens —
   but the real fix, if this needs to work reliably in production, is more
   CPU (a paid instance tier), not a longer timeout.
+
+  Live testing also caught a real bug this surfaced: navigation (`page.goto`)
+  and waiting for the captured response each had their **own independent**
+  `REQUEST_TIMEOUT_SECONDS` budget, so a slow-but-successful navigation
+  followed by a slow capture could take up to roughly *double* the
+  configured timeout — comfortably exceeding Render's platform timeout even
+  with `REQUEST_TIMEOUT_SECONDS` correctly set below it, producing the same
+  opaque empty `502` this setting exists to avoid. Fixed by sharing a single
+  deadline across both steps (`_remaining_seconds`/`_remaining_ms` in
+  `app/linkedin_client.py`) so the combined worst case is bounded by
+  `REQUEST_TIMEOUT_SECONDS`, not roughly 2×. Browser cold-start time (the
+  free tier spins the container down after ~15 min idle, so most requests
+  hit a cold start) still isn't covered by that budget — if `502`s persist
+  after this fix, try lowering `REQUEST_TIMEOUT_SECONDS` further (e.g. 15s)
+  to leave more headroom, or move to a paid tier.
 - **`/api/v1/find-profile-url` inherits every limitation above** (it uses
   the same browser/session machinery) plus two of its own: LinkedIn caps
   people-search results for non-Premium accounts (its "commercial use

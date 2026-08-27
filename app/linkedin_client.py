@@ -86,6 +86,18 @@ class LinkedInDailyLimitExceeded(Exception):
     predictable regardless of how many callers are hitting the API."""
 
 
+def _remaining_seconds(deadline: float, floor: float = 0.5) -> float:
+    """Seconds left until `deadline` (a `time.monotonic()` timestamp),
+    never below `floor` — an already-expired deadline still gets one last
+    short attempt rather than a zero/negative timeout, which some APIs
+    (asyncio.wait_for included) reject or treat as "no timeout"."""
+    return max(floor, deadline - time.monotonic())
+
+
+def _remaining_ms(deadline: float, floor: float = 0.5) -> float:
+    return _remaining_seconds(deadline, floor) * 1000
+
+
 def extract_public_identifier(profile_url: str) -> str:
     """Pull the `in/<public-id>` slug out of any LinkedIn profile URL shape.
 
@@ -238,16 +250,23 @@ class LinkedInClient:
         page = await context.new_page()
         page.on("response", on_response)
 
+        # A single deadline shared across BOTH steps below, rather than a
+        # full `request_timeout_seconds` budget for each — goto succeeding
+        # slowly must not leave the response-capture wait a second full
+        # timeout on top of that. Two independent per-step timeouts can add
+        # up to roughly double the configured value, which is exactly what
+        # let a request run long enough to hit Render's platform-level
+        # proxy timeout with an opaque empty 502 instead of our own clean
+        # JSON error — see README Known Limitations.
+        deadline = time.monotonic() + self._settings.request_timeout_seconds
+
         try:
-            timeout_ms = self._settings.request_timeout_seconds * 1000
             await self._goto_or_raise_bot_detected(
-                page, f"https://www.linkedin.com/in/{public_identifier}/", timeout_ms
+                page, f"https://www.linkedin.com/in/{public_identifier}/", _remaining_ms(deadline)
             )
 
             try:
-                await asyncio.wait_for(
-                    response_seen.wait(), timeout=self._settings.request_timeout_seconds
-                )
+                await asyncio.wait_for(response_seen.wait(), timeout=_remaining_seconds(deadline))
             except asyncio.TimeoutError:
                 if any(marker in page.url for marker in _LOGIN_WALL_MARKERS):
                     raise LinkedInAuthError(
@@ -312,12 +331,16 @@ class LinkedInClient:
         context = await self._new_stealth_context()
         page = await context.new_page()
 
+        # Shared deadline across both steps — see the matching comment in
+        # fetch_profile_view for why two independent full-timeout steps is
+        # a bug, not just belt-and-suspenders.
+        deadline = time.monotonic() + self._settings.request_timeout_seconds
+
         try:
-            timeout_ms = self._settings.request_timeout_seconds * 1000
-            await self._goto_or_raise_bot_detected(page, search_url, timeout_ms)
+            await self._goto_or_raise_bot_detected(page, search_url, _remaining_ms(deadline))
 
             try:
-                await page.wait_for_selector('a[href*="/in/"]', timeout=timeout_ms)
+                await page.wait_for_selector('a[href*="/in/"]', timeout=_remaining_ms(deadline))
             except PlaywrightError:
                 if any(marker in page.url for marker in _LOGIN_WALL_MARKERS):
                     raise LinkedInAuthError(
