@@ -14,6 +14,7 @@ from app.linkedin_client import (
     LinkedInBotDetected,
     LinkedInCaptureTimeout,
     LinkedInClient,
+    LinkedInDailyLimitExceeded,
     LinkedInProfileNotFound,
     LinkedInRateLimited,
     LinkedInSearchNoMatch,
@@ -108,7 +109,13 @@ async def get_profile(
         raw = await _client.fetch_profile_view(public_id)
     except LinkedInProfileNotFound as exc:
         raise HTTPException(status_code=404, detail=f"Profile not found: {exc}") from exc
-    except (LinkedInBotDetected, LinkedInCaptureTimeout, LinkedInAuthError, LinkedInRateLimited) as exc:
+    except (
+        LinkedInBotDetected,
+        LinkedInCaptureTimeout,
+        LinkedInAuthError,
+        LinkedInRateLimited,
+        LinkedInDailyLimitExceeded,
+    ) as exc:
         logger.warning("Known LinkedIn limitation fetching %s: %s", public_id, exc)
         raise _known_limitation_http_exception(exc) from exc
     except Exception as exc:  # noqa: BLE001 - surface upstream failures as 502
@@ -153,7 +160,13 @@ async def find_profile_url(
         profile_url = await _client.search_profile_url(name, company=company, email=email)
     except LinkedInSearchNoMatch as exc:
         raise HTTPException(status_code=404, detail=f"No LinkedIn profile matched: {exc}") from exc
-    except (LinkedInBotDetected, LinkedInCaptureTimeout, LinkedInAuthError, LinkedInRateLimited) as exc:
+    except (
+        LinkedInBotDetected,
+        LinkedInCaptureTimeout,
+        LinkedInAuthError,
+        LinkedInRateLimited,
+        LinkedInDailyLimitExceeded,
+    ) as exc:
         logger.warning("Known LinkedIn limitation searching for %r: %s", name, exc)
         raise _known_limitation_http_exception(exc) from exc
     except Exception as exc:  # noqa: BLE001 - surface upstream failures as 502
@@ -208,6 +221,19 @@ def _known_limitation_http_exception(exc: Exception) -> HTTPException:
                 "alert": (
                     "Known limitation: the configured li_at cookie may be expired, or "
                     "LinkedIn challenged the session. See README 'Known limitations'."
+                ),
+            },
+        )
+    if isinstance(exc, LinkedInDailyLimitExceeded):
+        return HTTPException(
+            status_code=429,
+            detail={
+                "error": str(exc),
+                "alert": (
+                    "Known limitation: this is a self-imposed daily safety cap "
+                    "(DAILY_REQUEST_LIMIT), not LinkedIn itself rate-limiting — it exists "
+                    "to keep this instance's footprint against the LinkedIn account "
+                    "predictable. Resets at 00:00 UTC. See README 'Known limitations'."
                 ),
             },
         )

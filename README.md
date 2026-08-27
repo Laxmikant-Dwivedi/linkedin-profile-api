@@ -65,10 +65,15 @@ The flow:
 4. **Serve** — a FastAPI app (`app/main.py`) exposes `GET /api/v1/profile`,
    gated by an API key, with a per-key rate limit and a TTL cache so repeat
    lookups of the same profile don't re-hit LinkedIn.
-5. **Throttle** — a global minimum interval between outbound LinkedIn
-   requests (`MIN_REQUEST_INTERVAL_SECONDS`) is enforced process-wide,
-   regardless of how many API callers are hitting this service concurrently,
-   to keep the LinkedIn account's behavior looking non-scripted.
+5. **Throttle** — outbound LinkedIn requests are spaced by a randomized
+   interval (`MIN_REQUEST_INTERVAL_SECONDS`–`MAX_REQUEST_INTERVAL_SECONDS`,
+   not a fixed delay — perfectly even spacing is itself a machine-like
+   tell), enforced process-wide regardless of how many API callers are
+   hitting this service concurrently. A separate `DAILY_REQUEST_LIMIT`
+   caps this instance's total LinkedIn-bound requests per rolling UTC day,
+   independent of LinkedIn's own rate limiting — a self-imposed ceiling on
+   this account's total automated footprint (`app/linkedin_client.py`'s
+   `_GlobalRateLimiter` and `_DailyRequestBudget`).
 
 ## API
 
@@ -157,7 +162,7 @@ e.g.:
 | 400 | URL didn't contain a `/in/<public-id>` segment |
 | 401 | Missing/invalid `X-API-Key` |
 | 404 | LinkedIn returned "not found" for that profile |
-| 429 | Per-key rate limit exceeded, or LinkedIn itself rate-limited us |
+| 429 | Per-key rate limit exceeded, `DAILY_REQUEST_LIMIT` reached for this instance, or LinkedIn itself rate-limited us |
 | 502 | LinkedIn session invalid/expired, bot detection triggered, a capture timeout, or an unexpected upstream failure — check for an `alert` field first |
 
 ### `GET /api/v1/find-profile-url?name=<full name>&company=<company>|&email=<email>`
@@ -253,9 +258,9 @@ pip install pytest
 pytest tests/ -v
 ```
 
-The test suite covers URL parsing and the Voyager-response parser against a
-fixture payload (no live LinkedIn calls, no browser needed — nothing here
-talks to LinkedIn during tests).
+The test suite covers URL parsing, the Voyager-response parser against a
+fixture payload, and the daily-request-budget logic (no live LinkedIn
+calls, no browser needed — nothing here talks to LinkedIn during tests).
 
 ### 5. Run with Docker
 
@@ -335,6 +340,12 @@ you HTTPS automatically):
   403s: confirm with `/health` that the cookie loaded, try a longer
   `REQUEST_TIMEOUT_SECONDS`, and expect that getting this fully reliable
   is genuinely open-ended work, not a one-line fix.
+- **The default `DAILY_REQUEST_LIMIT=300` (and the jittered pacing) are
+  heuristics, not a verified-safe number.** There's no universal safe
+  volume — it depends on account age, history, and how "normal" its usage
+  otherwise looks, none of which this service can know. Treat these as a
+  reasonable conservative starting point to tune down (or up) for your own
+  account, not a guarantee against restriction.
 - **Free-tier hosting is CPU-starved for a headless browser, and this
   changes the failure mode.** Deployed to Render's free tier (0.1 CPU,
   512 MB) and tested live: no `ERR_TOO_MANY_REDIRECTS` this time — the

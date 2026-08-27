@@ -24,9 +24,19 @@ class Settings(BaseSettings):
     # operator's LinkedIn session / trigger rate limiting or a ban.
     api_key: str = ""
 
-    # Minimum seconds between outbound requests to LinkedIn, enforced
-    # globally, to stay well under anything that looks like scripted abuse.
+    # Outbound requests to LinkedIn are spaced by a random interval drawn
+    # from [min, max] rather than a fixed delay — evenly-spaced requests are
+    # themselves a machine-like tell; jittered pacing is closer to how a
+    # human actually browses.
     min_request_interval_seconds: float = 3.0
+    max_request_interval_seconds: float = 8.0
+
+    # Safety ceiling on how many LinkedIn-bound requests (profile fetch +
+    # people search combined) this process will make in a rolling UTC day,
+    # independent of the per-caller API rate limit — caps this instance's
+    # total footprint against the LinkedIn account regardless of how many
+    # different API keys are calling it. 0 disables the cap.
+    daily_request_limit: int = 300
 
     # How long a scraped profile is cached before being re-fetched.
     cache_ttl_seconds: int = 3600

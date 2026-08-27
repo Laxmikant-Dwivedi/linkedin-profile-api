@@ -20,6 +20,7 @@ change at all.
 """
 
 import asyncio
+import random
 import re
 import time
 import urllib.parse
@@ -77,6 +78,14 @@ class LinkedInSearchNoMatch(Exception):
     results. See README Known Limitations."""
 
 
+class LinkedInDailyLimitExceeded(Exception):
+    """Raised when this process has already made `daily_request_limit`
+    LinkedIn-bound requests today. A self-imposed safety ceiling — distinct
+    from LinkedInRateLimited, which reflects LinkedIn itself pushing back —
+    meant to keep this instance's total footprint against the account
+    predictable regardless of how many callers are hitting the API."""
+
+
 def extract_public_identifier(profile_url: str) -> str:
     """Pull the `in/<public-id>` slug out of any LinkedIn profile URL shape.
 
@@ -91,26 +100,63 @@ def extract_public_identifier(profile_url: str) -> str:
 
 class _GlobalRateLimiter:
     """Process-wide throttle so we never hammer LinkedIn back-to-back,
-    regardless of how many API requests arrive concurrently."""
+    regardless of how many API requests arrive concurrently. Spaces
+    requests by a randomized interval rather than a fixed delay —
+    perfectly even spacing is itself a machine-like tell that's easy to
+    fingerprint; jittered pacing looks closer to a human browsing."""
 
-    def __init__(self, min_interval_seconds: float):
+    def __init__(self, min_interval_seconds: float, max_interval_seconds: float):
         self._min_interval = min_interval_seconds
+        self._max_interval = max(max_interval_seconds, min_interval_seconds)
         self._lock = asyncio.Lock()
         self._last_request_at = 0.0
 
     async def wait_turn(self) -> None:
         async with self._lock:
             now = time.monotonic()
+            target_interval = random.uniform(self._min_interval, self._max_interval)
             elapsed = now - self._last_request_at
-            if elapsed < self._min_interval:
-                await asyncio.sleep(self._min_interval - elapsed)
+            if elapsed < target_interval:
+                await asyncio.sleep(target_interval - elapsed)
             self._last_request_at = time.monotonic()
+
+
+class _DailyRequestBudget:
+    """Caps LinkedIn-bound requests to `limit` per rolling UTC calendar day.
+    `limit <= 0` disables the cap. This is a self-imposed safety ceiling on
+    top of (not a replacement for) LinkedIn's own rate limiting — it bounds
+    this process's total footprint regardless of how many API callers or
+    distinct profiles/searches are driving it."""
+
+    def __init__(self, limit: int):
+        self._limit = limit
+        self._lock = asyncio.Lock()
+        self._day: Optional[str] = None
+        self._count = 0
+
+    async def consume(self) -> None:
+        if self._limit <= 0:
+            return
+        async with self._lock:
+            today = time.strftime("%Y-%m-%d", time.gmtime())
+            if today != self._day:
+                self._day = today
+                self._count = 0
+            if self._count >= self._limit:
+                raise LinkedInDailyLimitExceeded(
+                    f"This instance has already made {self._count} LinkedIn requests "
+                    f"today (limit {self._limit}). Resets at 00:00 UTC."
+                )
+            self._count += 1
 
 
 class LinkedInClient:
     def __init__(self, settings: Settings):
         self._settings = settings
-        self._rate_limiter = _GlobalRateLimiter(settings.min_request_interval_seconds)
+        self._rate_limiter = _GlobalRateLimiter(
+            settings.min_request_interval_seconds, settings.max_request_interval_seconds
+        )
+        self._daily_budget = _DailyRequestBudget(settings.daily_request_limit)
         self._playwright = None
         self._browser = None
         self._startup_lock = asyncio.Lock()
@@ -169,6 +215,7 @@ class LinkedInClient:
         if not self._settings.is_configured:
             raise LinkedInAuthError("LI_AT_COOKIE is not configured on the server.")
 
+        await self._daily_budget.consume()
         await self._rate_limiter.wait_turn()
         await self._ensure_browser()
 
@@ -258,6 +305,7 @@ class LinkedInClient:
         query = " ".join(part for part in [full_name, company or email] if part)
         search_url = "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(query)
 
+        await self._daily_budget.consume()
         await self._rate_limiter.wait_turn()
         await self._ensure_browser()
 
