@@ -284,3 +284,17 @@ you HTTPS automatically):
   403s: confirm with `/health` that the cookie loaded, try a longer
   `REQUEST_TIMEOUT_SECONDS`, and expect that getting this fully reliable
   is genuinely open-ended work, not a one-line fix.
+- **Free-tier hosting is CPU-starved for a headless browser, and this
+  changes the failure mode.** Deployed to Render's free tier (0.1 CPU,
+  512 MB) and tested live: no `ERR_TOO_MANY_REDIRECTS` this time — the
+  navigation succeeded — but the `profileView` network response never
+  arrived before our own request timeout, then before Render's own
+  platform-level proxy timeout (~30s, independent of anything configurable
+  in this app) kicked in and returned an empty `502` from Render's edge
+  infrastructure rather than from the app. Rendering a JS-heavy SPA like a
+  LinkedIn profile page is measurably slower on 0.1 vCPU than on a normal
+  machine. `REQUEST_TIMEOUT_SECONDS` is deliberately kept a little below
+  the platform's own timeout (see `.env.example`) so the app returns a
+  clean JSON error instead of an opaque empty response when this happens —
+  but the real fix, if this needs to work reliably in production, is more
+  CPU (a paid instance tier), not a longer timeout.
