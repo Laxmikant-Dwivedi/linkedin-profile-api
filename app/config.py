@@ -14,9 +14,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # LinkedIn session — obtained by logging into linkedin.com in a real
-    # browser and copying the `li_at` and `JSESSIONID` cookies. See README.
+    # browser and copying the `li_at` cookie. See README. A headless
+    # browser drives the actual scrape, so no CSRF/JSESSIONID handling is
+    # needed here — the browser establishes its own session.
     li_at_cookie: str = ""
-    jsessionid_cookie: str = ""
 
     # API key clients must send in the `X-API-Key` header. Required so this
     # publicly hosted service can't be used by strangers to drain the
@@ -41,7 +42,7 @@ class Settings(BaseSettings):
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.li_at_cookie and self.jsessionid_cookie)
+        return bool(self.li_at_cookie)
 
 
 @lru_cache

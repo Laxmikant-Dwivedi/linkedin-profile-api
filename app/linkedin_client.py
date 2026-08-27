@@ -1,45 +1,51 @@
-"""Thin client around LinkedIn's internal "Voyager" API.
+"""Fetches LinkedIn's internal "Voyager" profile JSON using a real headless
+browser, rather than a raw HTTP client.
 
-LinkedIn's public profile pages are rendered client-side; the same data is
-fetched by the browser from undocumented internal REST endpoints
-(`/voyager/api/...`). This module talks to those endpoints directly using an
-authenticated session cookie, which is what "reverse engineering the
-LinkedIn API" means in practice — there is no official public API for this.
+Earlier iteration of this used `httpx` to call
+`/voyager/api/identity/profiles/<id>/profileView` directly with `li_at` +
+`JSESSIONID` cookies and a matching `csrf-token` header. That's the
+"textbook" reverse-engineering approach and it's how the endpoint URL/shape
+here was discovered — but live testing against a real account showed
+LinkedIn's edge now rejects that kind of request with `403 CSRF check
+failed`, independent of whether the cookies/token were valid: a bare HTTP
+client has a different TLS/HTTP2 fingerprint than a browser and gets
+filtered before the CSRF logic is even meaningfully checked.
 
-This is unofficial and unsupported by LinkedIn. It relies on cookie-based
-session auth (li_at + JSESSIONID) obtained by the operator logging into
-linkedin.com in a real browser — see README for how to grab them. Automated
-username/password login is deliberately NOT implemented: it reliably
-triggers LinkedIn's checkpoint/CAPTCHA flow when done from a server, and
-repeated failed attempts risk the account being restricted.
+Driving a real (headless) Chromium sidesteps that: we inject only the
+`li_at` cookie, navigate to the profile page, and let the browser's own JS
+make its normal authenticated request to that same `profileView` endpoint
+— which we intercept via the Playwright network-response listener. The
+JSON payload is identical to before, so `app/parser.py` didn't need to
+change at all.
 """
 
 import asyncio
 import re
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-import httpx
+from playwright.async_api import Response, async_playwright
 
 from app.config import Settings
 
-VOYAGER_BASE = "https://www.linkedin.com/voyager/api"
+_PUBLIC_ID_RE = re.compile(r"linkedin\.com/in/([^/?#]+)", re.IGNORECASE)
 
-_PUBLIC_ID_RE = re.compile(
-    r"linkedin\.com/in/([^/?#]+)", re.IGNORECASE
-)
+_PROFILE_VIEW_PATH = "/voyager/api/identity/profiles/"
+_LOGIN_WALL_MARKERS = ("/authwall", "/login", "/checkpoint/")
 
 
 class LinkedInAuthError(Exception):
-    """Raised when the configured session cookies are missing/expired."""
+    """Raised when the configured session cookie is missing/expired."""
 
 
 class LinkedInProfileNotFound(Exception):
-    """Raised when LinkedIn returns 404 for the requested profile."""
+    """Raised when the profile page never yields a profileView response
+    (private profile fully outside the viewer's network, deleted account,
+    typo'd URL, etc.)."""
 
 
 class LinkedInRateLimited(Exception):
-    """Raised when LinkedIn responds with 429 or a checkpoint challenge."""
+    """Raised when LinkedIn responds with 429 to the intercepted request."""
 
 
 def extract_public_identifier(profile_url: str) -> str:
@@ -50,9 +56,7 @@ def extract_public_identifier(profile_url: str) -> str:
     """
     match = _PUBLIC_ID_RE.search(profile_url.strip())
     if not match:
-        raise ValueError(
-            f"Could not find a /in/<public-id> segment in URL: {profile_url!r}"
-        )
+        raise ValueError(f"Could not find a /in/<public-id> segment in URL: {profile_url!r}")
     return match.group(1).rstrip("/")
 
 
@@ -78,53 +82,115 @@ class LinkedInClient:
     def __init__(self, settings: Settings):
         self._settings = settings
         self._rate_limiter = _GlobalRateLimiter(settings.min_request_interval_seconds)
+        self._playwright = None
+        self._browser = None
+        self._startup_lock = asyncio.Lock()
 
-    def _headers(self) -> Dict[str, str]:
-        # csrf-token must match the JSESSIONID cookie value (LinkedIn quotes
-        # it as "ajax:1234567890" in the cookie; the header wants it as-is).
-        csrf = self._settings.jsessionid_cookie
-        return {
-            "User-Agent": self._settings.user_agent,
-            "Accept": "application/vnd.linkedin.normalized+json+2.1",
-            "csrf-token": csrf,
-            "x-restli-protocol-version": "2.0.0",
-            "x-li-lang": "en_US",
-        }
+    async def _ensure_browser(self) -> None:
+        if self._browser is not None:
+            return
+        async with self._startup_lock:
+            if self._browser is not None:
+                return
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
 
-    def _cookies(self) -> Dict[str, str]:
-        return {
-            "li_at": self._settings.li_at_cookie,
-            "JSESSIONID": self._settings.jsessionid_cookie,
-        }
+    async def close(self) -> None:
+        if self._browser is not None:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright is not None:
+            await self._playwright.stop()
+            self._playwright = None
 
     async def fetch_profile_view(self, public_identifier: str) -> Dict[str, Any]:
-        """Calls the `profileView` aggregate endpoint, which returns
-        summary, positions, education, skills, certifications and
-        languages in a single normalized JSON payload."""
         if not self._settings.is_configured:
-            raise LinkedInAuthError(
-                "LI_AT_COOKIE / JSESSIONID_COOKIE are not configured on the server."
-            )
+            raise LinkedInAuthError("LI_AT_COOKIE is not configured on the server.")
 
         await self._rate_limiter.wait_turn()
+        await self._ensure_browser()
 
-        url = f"{VOYAGER_BASE}/identity/profiles/{public_identifier}/profileView"
-        async with httpx.AsyncClient(
-            headers=self._headers(),
-            cookies=self._cookies(),
-            timeout=self._settings.request_timeout_seconds,
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(url)
+        context = await self._browser.new_context(
+            user_agent=self._settings.user_agent,
+            viewport={"width": 1366, "height": 900},
+            locale="en-US",
+            timezone_id="America/Los_Angeles",
+        )
+        # Headless Chromium exposes `navigator.webdriver = true` and a few
+        # other tells that automated-browser detectors key off; strip the
+        # obvious ones before any page script runs. This is a standard,
+        # widely-used mitigation for automation fingerprinting, not an
+        # attempt to defeat security controls.
+        await context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            window.chrome = { runtime: {} };
+            """
+        )
+        await context.add_cookies(
+            [
+                {
+                    "name": "li_at",
+                    "value": self._settings.li_at_cookie,
+                    "domain": ".linkedin.com",
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                }
+            ]
+        )
 
-        if response.status_code == 404:
-            raise LinkedInProfileNotFound(public_identifier)
-        if response.status_code in (401, 403):
-            raise LinkedInAuthError(
-                "LinkedIn rejected the session cookies (expired or invalid)."
+        captured: Dict[str, Any] = {}
+        response_seen = asyncio.Event()
+
+        async def on_response(response: Response) -> None:
+            if _PROFILE_VIEW_PATH not in response.url or "profileView" not in response.url:
+                return
+            captured["status"] = response.status
+            if response.status == 200:
+                try:
+                    captured["json"] = await response.json()
+                except Exception:  # noqa: BLE001 - body wasn't JSON, treat as failure below
+                    pass
+            response_seen.set()
+
+        page = await context.new_page()
+        page.on("response", on_response)
+
+        try:
+            timeout_ms = self._settings.request_timeout_seconds * 1000
+            await page.goto(
+                f"https://www.linkedin.com/in/{public_identifier}/",
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
             )
-        if response.status_code == 429:
-            raise LinkedInRateLimited("LinkedIn responded with 429 Too Many Requests.")
+            try:
+                await asyncio.wait_for(
+                    response_seen.wait(), timeout=self._settings.request_timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                if any(marker in page.url for marker in _LOGIN_WALL_MARKERS):
+                    raise LinkedInAuthError(
+                        "LinkedIn redirected to a login/checkpoint page — "
+                        "the li_at cookie is invalid, expired, or the account hit a security check."
+                    )
+                raise LinkedInProfileNotFound(public_identifier)
+        finally:
+            await page.close()
+            await context.close()
 
-        response.raise_for_status()
-        return response.json()
+        status: Optional[int] = captured.get("status")
+        if status == 404:
+            raise LinkedInProfileNotFound(public_identifier)
+        if status in (401, 403):
+            raise LinkedInAuthError("LinkedIn rejected the session (expired, invalid, or challenged).")
+        if status == 429:
+            raise LinkedInRateLimited("LinkedIn responded with 429 Too Many Requests.")
+        if "json" not in captured:
+            raise LinkedInProfileNotFound(public_identifier)
+        return captured["json"]

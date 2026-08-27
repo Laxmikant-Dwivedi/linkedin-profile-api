@@ -1,4 +1,7 @@
-FROM python:3.12-slim
+# Playwright's own image ships a matching Chromium build plus every system
+# dependency it needs — far less fragile than installing browser deps on a
+# generic slim image by hand.
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
 WORKDIR /app
 

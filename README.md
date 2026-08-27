@@ -22,16 +22,40 @@ covering the summary/headline/photo plus positions, education, skills,
 certifications and languages in one shot, which is why this service only
 needs one upstream call per profile.
 
+**This went through two iterations, and the second one is why the code looks
+the way it does:**
+
+1. First pass: call `profileView` directly with `httpx`, using `li_at` +
+   `JSESSIONID` cookies and a matching `csrf-token` header (the "textbook"
+   reverse-engineering approach, and how the endpoint URL/response shape
+   here was discovered in the first place). Live testing against a real
+   account got a clean `403 CSRF check failed` on every attempt, even with
+   fresh, valid cookies — a bare HTTP client has a different TLS/HTTP2
+   fingerprint than a real browser, and LinkedIn's edge filters that before
+   the CSRF token is meaningfully checked.
+2. Current approach: drive a real headless Chromium via Playwright
+   (`app/linkedin_client.py`), inject only the `li_at` cookie, navigate to
+   the profile page, and intercept the network response the *browser's own
+   JS* sends to that same `profileView` endpoint. The JSON payload is
+   identical either way, so the parser (`app/parser.py`) didn't need to
+   change. This is materially harder for LinkedIn to distinguish from a real
+   visit, though as documented under
+   [Known limitations](#known-limitations), it isn't a guaranteed bypass —
+   headless browsers have their own detectable tells, and this repo
+   includes the standard mitigations for those (masking
+   `navigator.webdriver`, disabling the automation-controlled flag) without
+   attempting to defeat any CAPTCHA/JS-challenge outright.
+
 The flow:
 
-1. **Auth** — instead of automating a LinkedIn login (which reliably trips
-   LinkedIn's CAPTCHA/checkpoint flow when done from a server), this uses a
-   session captured from a real browser login: the `li_at` and `JSESSIONID`
-   cookies, sent as `Cookie` headers plus a matching `csrf-token` header on
-   every request (`app/linkedin_client.py`).
-2. **Fetch** — `LinkedInClient.fetch_profile_view()` calls the `profileView`
-   endpoint with a browser-like `User-Agent` and the Voyager-specific
-   `Accept`/`x-restli-protocol-version` headers LinkedIn's frontend sends.
+1. **Auth** — a session cookie (`li_at`) captured from a real browser login
+   is injected into a fresh Playwright browser context per request; no
+   login automation, since that reliably trips LinkedIn's CAPTCHA/checkpoint
+   flow when done from a server.
+2. **Fetch** — `LinkedInClient.fetch_profile_view()` launches (or reuses) a
+   headless Chromium instance, opens `linkedin.com/in/<public-id>/`, and
+   listens for the `profileView` XHR the page itself fires, capturing its
+   JSON body.
 3. **Parse** — Voyager responses are "normalized": a `data` object plus a
    flat `included` array of entities (positions, education, skills, ...)
    tagged by `$type`. `app/parser.py` indexes `included` by type and builds
@@ -133,7 +157,7 @@ Interactive docs (Swagger UI) are auto-served at `/docs` once running.
 
 ## Setup
 
-### 1. Get LinkedIn session cookies
+### 1. Get your LinkedIn session cookie
 
 1. Log into linkedin.com in a normal browser with the account you're willing
    to use for this (ideally not your only/primary account, given the ToS
@@ -141,13 +165,10 @@ Interactive docs (Swagger UI) are auto-served at `/docs` once running.
 2. Open DevTools → Application (Chrome) / Storage (Firefox) → Cookies →
    `https://www.linkedin.com`.
 3. Copy the value of `li_at`.
-4. Copy the value of `JSESSIONID` — it looks like `"ajax:1234567890123456789"`,
-   quotes included; keep it exactly as shown.
-5. Put both into `.env` (copy `.env.example` first) as `LI_AT_COOKIE` and
-   `JSESSIONID_COOKIE`.
+4. Put it into `.env` (copy `.env.example` first) as `LI_AT_COOKIE`.
 
-These cookies expire (typically after ~1 year for `li_at`, sooner if you log
-out elsewhere or LinkedIn flags the session) — if `/health` starts reporting
+This cookie expires (typically after ~1 year, sooner if you log out
+elsewhere or LinkedIn flags the session) — if `/health` starts reporting
 auth errors, repeat this step.
 
 ### 2. Configure
@@ -156,9 +177,9 @@ auth errors, repeat this step.
 cp .env.example .env
 ```
 
-Fill in `LI_AT_COOKIE`, `JSESSIONID_COOKIE`, and set `API_KEY` to a random
-string you generate (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`)
-— this is what callers of *your* hosted API will need to send.
+Fill in `LI_AT_COOKIE`, and set `API_KEY` to a random string you generate
+(e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`) —
+this is what callers of *your* hosted API will need to send.
 
 ### 3. Run locally
 
@@ -168,6 +189,7 @@ python -m venv .venv
 # source .venv/bin/activate   # macOS/Linux
 
 pip install -r requirements.txt
+playwright install chromium   # one-time browser binary download (~140 MB)
 uvicorn app.main:app --reload
 ```
 
@@ -181,8 +203,8 @@ pytest tests/ -v
 ```
 
 The test suite covers URL parsing and the Voyager-response parser against a
-fixture payload (no live LinkedIn calls — nothing here talks to LinkedIn
-during tests).
+fixture payload (no live LinkedIn calls, no browser needed — nothing here
+talks to LinkedIn during tests).
 
 ### 5. Run with Docker
 
@@ -190,6 +212,11 @@ during tests).
 docker build -t linkedin-profile-api .
 docker run --rm -p 8000:8000 --env-file .env linkedin-profile-api
 ```
+
+The image is built on Playwright's own base image (`mcr.microsoft.com/playwright/python`),
+which bundles a matching Chromium build and all its system dependencies —
+several hundred MB larger than a plain Python slim image, but far less
+fragile than installing headless-browser dependencies by hand.
 
 ## Deployment
 
@@ -201,8 +228,11 @@ you HTTPS automatically):
 1. Push this repo to GitHub.
 2. Create a new Web Service from the repo (Render/Railway auto-detect the
    `Dockerfile`; for Fly.io run `fly launch` then `fly deploy`).
-3. Set `LI_AT_COOKIE`, `JSESSIONID_COOKIE`, and `API_KEY` as secret
-   environment variables in the platform's dashboard — **never** in the repo.
+3. Set `LI_AT_COOKIE` and `API_KEY` as secret environment variables in the
+   platform's dashboard — **never** in the repo. Give the service at least
+   ~1 GB RAM — a headless Chromium instance under load needs meaningfully
+   more than a typical free-tier API service; the smallest free tiers on
+   some platforms may be too small or too slow to cold-start it.
 4. Confirm `GET /health` on the public URL returns
    `"linkedin_session_configured": true`.
 
@@ -234,9 +264,23 @@ you HTTPS automatically):
   `null`) — the cover-photo field in Voyager's response wasn't reliably
   present across the profiles used to build this and was left as a
   documented gap rather than guessed at.
-- **Not tested against a live LinkedIn account** in this repo — the parser
-  is verified with unit tests against a realistic fixture payload
-  (`tests/test_parser.py`), but the exact Voyager response shape should be
-  reconfirmed against a real profile after you configure your own cookies,
-  since LinkedIn serves slightly different payload shapes over time and by
-  account region/experiment.
+- **Bot detection is an active adversary, not a solved problem.** This was
+  tested live against a real account during development. The first
+  (raw-HTTP) implementation got a consistent `403 CSRF check failed` from
+  LinkedIn's edge regardless of cookie validity — a bare HTTP client's
+  TLS/HTTP2 fingerprint alone was enough to get filtered. Switching to a
+  real headless Chromium (the current approach) got further, but a plain
+  headless launch hit `ERR_TOO_MANY_REDIRECTS` — LinkedIn's automation
+  detection (`navigator.webdriver` and related tells) bounced the
+  navigation into a security-challenge loop instead of serving the page.
+  The mitigations for that (masking `navigator.webdriver`, a realistic
+  viewport/locale, `--disable-blink-features=AutomationControlled`) are in
+  `app/linkedin_client.py`, but this repo does **not** claim they're a
+  guaranteed bypass — LinkedIn's detection evolves, and getting reliably
+  past it in production is exactly the hard, ongoing part of this problem
+  that commercial scrapers (PhantomBuster included) invest heavily in
+  (residential proxy pools, real browser fingerprint farms, session
+  warm-up). If a deployed instance still hits a redirect loop or repeated
+  403s: confirm with `/health` that the cookie loaded, try a longer
+  `REQUEST_TIMEOUT_SECONDS`, and expect that getting this fully reliable
+  is genuinely open-ended work, not a one-line fix.

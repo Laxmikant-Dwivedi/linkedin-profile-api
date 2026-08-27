@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -19,6 +20,20 @@ from app.schemas import LinkedInProfile
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("linkedin_profile_api")
 
+_settings = get_settings()
+_client = LinkedInClient(_settings)
+_cache = ProfileCache(max_size=_settings.cache_max_size, ttl_seconds=_settings.cache_ttl_seconds)
+# Per-caller ceiling independent of the global LinkedIn throttle, so one
+# noisy API key can't starve everyone else's request budget.
+_caller_rate_limiter = SlidingWindowRateLimiter(max_requests=20, window_seconds=60)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await _client.close()
+
+
 app = FastAPI(
     title="LinkedIn Profile API",
     description=(
@@ -27,14 +42,8 @@ app = FastAPI(
         "for setup and limitations."
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
-
-_settings = get_settings()
-_client = LinkedInClient(_settings)
-_cache = ProfileCache(max_size=_settings.cache_max_size, ttl_seconds=_settings.cache_ttl_seconds)
-# Per-caller ceiling independent of the global LinkedIn throttle, so one
-# noisy API key can't starve everyone else's request budget.
-_caller_rate_limiter = SlidingWindowRateLimiter(max_requests=20, window_seconds=60)
 
 
 def require_api_key(x_api_key: str = Header(default="")) -> str:
