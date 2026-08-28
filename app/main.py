@@ -12,7 +12,7 @@ from app.config import Settings, get_settings
 from app.linkedin_client import (
     LinkedInAuthError,
     LinkedInBotDetected,
-    LinkedInCaptureTimeout,
+    LinkedInRequestTimeout,
     LinkedInClient,
     LinkedInDailyLimitExceeded,
     LinkedInProfileNotFound,
@@ -111,7 +111,7 @@ async def get_profile(
         raise HTTPException(status_code=404, detail=f"Profile not found: {exc}") from exc
     except (
         LinkedInBotDetected,
-        LinkedInCaptureTimeout,
+        LinkedInRequestTimeout,
         LinkedInAuthError,
         LinkedInRateLimited,
         LinkedInDailyLimitExceeded,
@@ -162,7 +162,7 @@ async def find_profile_url(
         raise HTTPException(status_code=404, detail=f"No LinkedIn profile matched: {exc}") from exc
     except (
         LinkedInBotDetected,
-        LinkedInCaptureTimeout,
+        LinkedInRequestTimeout,
         LinkedInAuthError,
         LinkedInRateLimited,
         LinkedInDailyLimitExceeded,
@@ -193,23 +193,25 @@ def _known_limitation_http_exception(exc: Exception) -> HTTPException:
             detail={
                 "error": f"LinkedIn blocked the automated request: {exc}",
                 "alert": (
-                    "Known limitation: LinkedIn's automation detection can bounce a "
-                    "headless-browser request into a redirect loop instead of serving "
-                    "the page. This is not a bug in this service — see README "
-                    "'Known limitations' for what was verified during live testing."
+                    "Known limitation: LinkedIn responded with a self-redirect loop "
+                    "instead of serving the request — observed live even on a plain "
+                    "authenticated page load, consistent with an account/session-level "
+                    "challenge rather than a flaw in this request specifically. This is "
+                    "not a bug in this service — see README 'Known limitations' for what "
+                    "was verified during live testing."
                 ),
             },
         )
-    if isinstance(exc, LinkedInCaptureTimeout):
+    if isinstance(exc, LinkedInRequestTimeout):
         return HTTPException(
             status_code=502,
             detail={
-                "error": f"No data was received from LinkedIn in time for '{exc}'.",
+                "error": f"The request to LinkedIn itself timed out or failed: {exc}",
                 "alert": (
-                    "Known limitation: this can happen if the host is too CPU-constrained "
-                    "to finish rendering LinkedIn's page before the timeout (common on "
-                    "free-tier hosting), or if the input is wrong. See README "
-                    "'Known limitations'."
+                    "Known limitation: this is a network-level failure talking to "
+                    "LinkedIn (slow connection, DNS, TLS handshake), not a rejection "
+                    "from LinkedIn — retrying, or raising REQUEST_TIMEOUT_SECONDS, may "
+                    "help. See README 'Known limitations'."
                 ),
             },
         )

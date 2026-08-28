@@ -1,22 +1,44 @@
-"""Fetches LinkedIn's internal "Voyager" profile JSON using a real headless
-browser, rather than a raw HTTP client.
+"""Fetches LinkedIn's internal "Voyager" profile JSON via direct HTTP
+requests — no browser, no JavaScript execution, exactly the assignment's
+"purely reverse-engineered ... does not use a browser" requirement.
 
-Earlier iteration of this used `httpx` to call
-`/voyager/api/identity/profiles/<id>/profileView` directly with `li_at` +
-`JSESSIONID` cookies and a matching `csrf-token` header. That's the
-"textbook" reverse-engineering approach and it's how the endpoint URL/shape
-here was discovered — but live testing against a real account showed
-LinkedIn's edge now rejects that kind of request with `403 CSRF check
-failed`, independent of whether the cookies/token were valid: a bare HTTP
-client has a different TLS/HTTP2 fingerprint than a browser and gets
-filtered before the CSRF logic is even meaningfully checked.
+This went through three iterations, and the current one is a direct result
+of what live testing against a real account showed at each step:
 
-Driving a real (headless) Chromium sidesteps that: we inject only the
-`li_at` cookie, navigate to the profile page, and let the browser's own JS
-make its normal authenticated request to that same `profileView` endpoint
-— which we intercept via the Playwright network-response listener. The
-JSON payload is identical to before, so `app/parser.py` didn't need to
-change at all.
+1. Plain `httpx` calling `/voyager/api/identity/profiles/<id>/profileView`
+   with `li_at` + `JSESSIONID` cookies and a matching `csrf-token` header
+   (the "textbook" reverse-engineering approach, and how this endpoint was
+   found in the first place) got a clean `403 CSRF check failed` on every
+   attempt, even with fresh, valid cookies. A bare HTTP client's TLS/HTTP2
+   handshake has a different fingerprint than a real browser's, and
+   LinkedIn's edge filters on that before the CSRF token is meaningfully
+   checked at all.
+2. A headless-Chromium version (driving a real browser to make the same
+   request) got past that specific check, confirming the TLS/HTTP2
+   fingerprint theory — but a browser is explicitly disallowed for this
+   assignment, so that path was abandoned rather than pursued further.
+3. Current approach: `curl_cffi`, a library that reproduces a real Chrome
+   build's TLS/JA3 fingerprint (and matching header set — `Sec-Ch-Ua`,
+   `Accept`, etc.) at the HTTP-client level, with no browser or JS involved.
+   Verified live that this alone clears the CSRF check `httpx` couldn't.
+   The remaining piece: LinkedIn only issues `bcookie`/`bscookie`/`lidc`/
+   `JSESSIONID` to a session that has actually visited the site — a fresh
+   client that presents `li_at` cold, with none of that history, doesn't
+   look like a real returning session. `_ensure_session()` does one
+   anonymous GET to linkedin.com first (exactly what a real browser's very
+   first request of the day looks like) to pick up those cookies *before*
+   ever presenting `li_at`, then reuses that one session for every
+   subsequent request — a real browser only "warms up" once, not before
+   every single page view either.
+
+Live end-to-end verification of this final version was inconclusive: after
+extensive testing throughout the day (the abandoned browser version
+included), the test account itself started getting a self-redirecting
+`302` loop back to the exact URL requested — on a plain `/feed/` page load
+with nothing but `li_at`, no API call involved — which looks like LinkedIn
+challenging the account/session itself rather than rejecting anything
+about this specific request. See README "Known limitations" for the full
+account of what was and wasn't confirmed live.
 """
 
 import asyncio
@@ -24,58 +46,55 @@ import random
 import re
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
+from urllib.parse import urljoin, urlsplit
 
-from playwright.async_api import BrowserContext, Error as PlaywrightError
-from playwright.async_api import Response, async_playwright
+from curl_cffi.requests import AsyncSession, RequestsError
 
 from app.config import Settings
 
 _PUBLIC_ID_RE = re.compile(r"linkedin\.com/in/([^/?#]+)", re.IGNORECASE)
+_SEARCH_RESULT_PUBLIC_ID_RE = re.compile(r"/in/([A-Za-z0-9\-_%]+)")
 
-_PROFILE_VIEW_PATH = "/voyager/api/identity/profiles/"
+_PROFILE_VIEW_URL = "https://www.linkedin.com/voyager/api/identity/profiles/{public_id}/profileView"
+_SEARCH_URL = "https://www.linkedin.com/voyager/api/search/dash/clusters"
 _LOGIN_WALL_MARKERS = ("/authwall", "/login", "/checkpoint/")
-
-_STEALTH_INIT_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-window.chrome = { runtime: {} };
-"""
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
 
 class LinkedInAuthError(Exception):
-    """Raised when the configured session cookie is missing/expired."""
+    """Raised when the configured session cookie is missing/expired, or
+    LinkedIn redirected to an explicit login/checkpoint page."""
 
 
 class LinkedInProfileNotFound(Exception):
     """Raised when LinkedIn explicitly told us the profile doesn't exist
-    (a real 404 from the intercepted response)."""
+    (a real 404, or a 200 whose body wasn't the JSON we expected)."""
 
 
 class LinkedInRateLimited(Exception):
-    """Raised when LinkedIn responds with 429 to the intercepted request."""
+    """Raised when LinkedIn responds with 429."""
 
 
 class LinkedInBotDetected(Exception):
-    """Raised when LinkedIn's automation detection visibly intervened —
-    e.g. bounced the navigation into a redirect loop — rather than serving
-    the page. A known, documented limitation; see README."""
+    """Raised when LinkedIn responded with a redirect back to the exact
+    URL that was requested — a self-redirect loop rather than a real
+    login-wall destination. Observed live even on a plain authenticated
+    page load with a valid `li_at` cookie and no API call involved,
+    consistent with an account/session-level challenge rather than
+    anything specific to this request. See README Known Limitations."""
 
 
-class LinkedInCaptureTimeout(Exception):
-    """Raised when the page loaded without any bot-detection signature, but
-    no `profileView` response ever arrived before our timeout. Ambiguous by
-    nature: could be a genuinely wrong public-id, or a CPU-starved host
-    that's simply too slow to finish rendering the page in time. See
-    README Known Limitations."""
+class LinkedInRequestTimeout(Exception):
+    """Raised when the HTTP request to LinkedIn itself timed out or failed
+    at the network level (not a LinkedIn-issued response at all)."""
 
 
 class LinkedInSearchNoMatch(Exception):
-    """Raised when a people-search returned no profile links at all —
-    genuinely no match, or LinkedIn served a blurred/limited results page
-    (its "commercial use limit" for non-Premium accounts) instead of real
-    results. See README Known Limitations."""
+    """Raised when a people-search response contained no `/in/<public-id>`
+    reference at all — genuinely no match, or LinkedIn served a
+    blurred/limited results payload (its "commercial use limit" for
+    non-Premium accounts) instead of real results."""
 
 
 class LinkedInDailyLimitExceeded(Exception):
@@ -84,18 +103,6 @@ class LinkedInDailyLimitExceeded(Exception):
     from LinkedInRateLimited, which reflects LinkedIn itself pushing back —
     meant to keep this instance's total footprint against the account
     predictable regardless of how many callers are hitting the API."""
-
-
-def _remaining_seconds(deadline: float, floor: float = 0.5) -> float:
-    """Seconds left until `deadline` (a `time.monotonic()` timestamp),
-    never below `floor` — an already-expired deadline still gets one last
-    short attempt rather than a zero/negative timeout, which some APIs
-    (asyncio.wait_for included) reject or treat as "no timeout"."""
-    return max(floor, deadline - time.monotonic())
-
-
-def _remaining_ms(deadline: float, floor: float = 0.5) -> float:
-    return _remaining_seconds(deadline, floor) * 1000
 
 
 def extract_public_identifier(profile_url: str) -> str:
@@ -108,6 +115,18 @@ def extract_public_identifier(profile_url: str) -> str:
     if not match:
         raise ValueError(f"Could not find a /in/<public-id> segment in URL: {profile_url!r}")
     return match.group(1).rstrip("/")
+
+
+def _is_self_redirect(request_url: str, location_header: str) -> bool:
+    """True if `location_header` resolves to the same URL that was
+    requested (ignoring a trailing slash) — LinkedIn's observed behavior
+    for a challenged session/account, rather than a real redirect
+    somewhere else (e.g. an actual login page)."""
+    if not location_header:
+        return False
+    resolved = urljoin(request_url, location_header)
+    a, b = urlsplit(resolved), urlsplit(request_url)
+    return (a.netloc, a.path.rstrip("/"), a.query) == (b.netloc, b.path.rstrip("/"), b.query)
 
 
 class _GlobalRateLimiter:
@@ -169,59 +188,49 @@ class LinkedInClient:
             settings.min_request_interval_seconds, settings.max_request_interval_seconds
         )
         self._daily_budget = _DailyRequestBudget(settings.daily_request_limit)
-        self._playwright = None
-        self._browser = None
+        self._session: Optional[AsyncSession] = None
         self._startup_lock = asyncio.Lock()
 
-    async def _ensure_browser(self) -> None:
-        if self._browser is not None:
-            return
+    async def _ensure_session(self) -> AsyncSession:
+        if self._session is not None:
+            return self._session
         async with self._startup_lock:
-            if self._browser is not None:
-                return
-            self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
+            if self._session is not None:
+                return self._session
+            session = AsyncSession(
+                impersonate=self._settings.impersonate_browser,
+                timeout=self._settings.request_timeout_seconds,
             )
+            # Anonymous warm-up BEFORE presenting li_at — see module
+            # docstring for why. Deliberately not using our own rate
+            # limiter/daily budget for this one bootstrap request: it's
+            # infrastructure setup, not a profile/search lookup.
+            await session.get("https://www.linkedin.com/", allow_redirects=True)
+            session.cookies.set("li_at", self._settings.li_at_cookie, domain=".linkedin.com")
+            self._session = session
+            return session
 
     async def close(self) -> None:
-        if self._browser is not None:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright is not None:
-            await self._playwright.stop()
-            self._playwright = None
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
 
-    async def _new_stealth_context(self) -> BrowserContext:
-        """A fresh browser context with the li_at session and the standard
-        automation-fingerprint mitigations applied — shared by every
-        LinkedIn-facing operation (profile fetch, people search, ...)."""
-        context = await self._browser.new_context(
-            user_agent=self._settings.user_agent,
-            viewport={"width": 1366, "height": 900},
-            locale="en-US",
-            timezone_id="America/Los_Angeles",
-        )
-        # Headless Chromium exposes `navigator.webdriver = true` and a few
-        # other tells that automated-browser detectors key off; strip the
-        # obvious ones before any page script runs. This is a standard,
-        # widely-used mitigation for automation fingerprinting, not an
-        # attempt to defeat security controls.
-        await context.add_init_script(_STEALTH_INIT_SCRIPT)
-        await context.add_cookies(
-            [
-                {
-                    "name": "li_at",
-                    "value": self._settings.li_at_cookie,
-                    "domain": ".linkedin.com",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                }
-            ]
-        )
-        return context
+    @staticmethod
+    def _current_jsessionid(session: AsyncSession) -> Optional[str]:
+        for cookie in session.cookies.jar:
+            if cookie.name == "JSESSIONID":
+                return cookie.value
+        return None
+
+    def _voyager_headers(self, session: AsyncSession, referer: str) -> Dict[str, str]:
+        jsessionid = self._current_jsessionid(session)
+        return {
+            "Accept": "application/vnd.linkedin.normalized+json+2.1",
+            "csrf-token": f'"{jsessionid}"' if jsessionid else "",
+            "x-restli-protocol-version": "2.0.0",
+            "x-li-lang": "en_US",
+            "Referer": referer,
+        }
 
     async def fetch_profile_view(self, public_identifier: str) -> Dict[str, Any]:
         if not self._settings.is_configured:
@@ -229,138 +238,105 @@ class LinkedInClient:
 
         await self._daily_budget.consume()
         await self._rate_limiter.wait_turn()
-        await self._ensure_browser()
+        session = await self._ensure_session()
 
-        context = await self._new_stealth_context()
-
-        captured: Dict[str, Any] = {}
-        response_seen = asyncio.Event()
-
-        async def on_response(response: Response) -> None:
-            if _PROFILE_VIEW_PATH not in response.url or "profileView" not in response.url:
-                return
-            captured["status"] = response.status
-            if response.status == 200:
-                try:
-                    captured["json"] = await response.json()
-                except Exception:  # noqa: BLE001 - body wasn't JSON, treat as failure below
-                    pass
-            response_seen.set()
-
-        page = await context.new_page()
-        page.on("response", on_response)
-
-        # A single deadline shared across BOTH steps below, rather than a
-        # full `request_timeout_seconds` budget for each — goto succeeding
-        # slowly must not leave the response-capture wait a second full
-        # timeout on top of that. Two independent per-step timeouts can add
-        # up to roughly double the configured value, which is exactly what
-        # let a request run long enough to hit Render's platform-level
-        # proxy timeout with an opaque empty 502 instead of our own clean
-        # JSON error — see README Known Limitations.
-        deadline = time.monotonic() + self._settings.request_timeout_seconds
+        url = _PROFILE_VIEW_URL.format(public_id=public_identifier)
+        referer = f"https://www.linkedin.com/in/{public_identifier}/"
 
         try:
-            await self._goto_or_raise_bot_detected(
-                page, f"https://www.linkedin.com/in/{public_identifier}/", _remaining_ms(deadline)
+            response = await session.get(
+                url, headers=self._voyager_headers(session, referer), allow_redirects=False
             )
+        except RequestsError as exc:
+            raise LinkedInRequestTimeout(str(exc)) from exc
 
-            try:
-                await asyncio.wait_for(response_seen.wait(), timeout=_remaining_seconds(deadline))
-            except asyncio.TimeoutError:
-                if any(marker in page.url for marker in _LOGIN_WALL_MARKERS):
-                    raise LinkedInAuthError(
-                        "LinkedIn redirected to a login/checkpoint page — "
-                        "the li_at cookie is invalid, expired, or the account hit a security check."
-                    )
-                raise LinkedInCaptureTimeout(public_identifier)
-        finally:
-            await page.close()
-            await context.close()
+        if response.status_code in _REDIRECT_STATUSES:
+            self._raise_for_redirect(url, response.headers.get("location", ""))
 
-        status: Optional[int] = captured.get("status")
-        if status == 404:
+        if response.status_code == 404:
             raise LinkedInProfileNotFound(public_identifier)
-        if status in (401, 403):
+        if response.status_code in (401, 403):
             raise LinkedInAuthError("LinkedIn rejected the session (expired, invalid, or challenged).")
-        if status == 429:
+        if response.status_code == 429:
             raise LinkedInRateLimited("LinkedIn responded with 429 Too Many Requests.")
-        if "json" not in captured:
+        if response.status_code != 200:
             raise LinkedInProfileNotFound(public_identifier)
-        return captured["json"]
 
-    async def _goto_or_raise_bot_detected(self, page, url: str, timeout_ms: float) -> None:
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        except PlaywrightError as exc:
-            if "ERR_TOO_MANY_REDIRECTS" in str(exc):
-                raise LinkedInBotDetected(
-                    "LinkedIn's automation detection bounced this request into a "
-                    "security-challenge redirect loop before the page loaded."
-                ) from exc
-            raise
+            return response.json()
+        except Exception as exc:  # noqa: BLE001 - body wasn't the JSON we expected
+            raise LinkedInProfileNotFound(public_identifier) from exc
+
+    def _raise_for_redirect(self, request_url: str, location: str) -> None:
+        if _is_self_redirect(request_url, location):
+            raise LinkedInBotDetected(
+                "LinkedIn responded with a redirect back to the exact URL requested, "
+                "instead of serving it — a challenge response observed even on a plain "
+                "authenticated page load during testing, not specific to this endpoint."
+            )
+        if any(marker in location for marker in _LOGIN_WALL_MARKERS):
+            raise LinkedInAuthError(
+                "LinkedIn redirected to a login/checkpoint page — "
+                "the li_at cookie is invalid, expired, or the account hit a security check."
+            )
+        raise LinkedInAuthError(f"LinkedIn redirected unexpectedly to {location!r}.")
 
     async def search_profile_url(
         self, full_name: str, company: Optional[str] = None, email: Optional[str] = None
     ) -> str:
-        """Searches LinkedIn's people search for `full_name` disambiguated by
-        `company` or `email`, and returns the first matching profile URL.
+        """Searches LinkedIn's people-search API for `full_name`
+        disambiguated by `company` or `email`, and returns the first
+        matching profile URL — mirrors PhantomBuster's "LinkedIn Profile
+        URL Finder". Requires `company` or `email` since name-only search
+        matches too many people to be useful (the same constraint that
+        tool documents).
 
-        Mirrors PhantomBuster's "LinkedIn Profile URL Finder": too many
-        people share a name for name-only search to be useful, so a company
-        or email is required to narrow it down (same constraint that tool
-        documents). Implemented via DOM extraction (`a[href*="/in/"]`)
-        rather than intercepting LinkedIn's internal search API response,
-        since the search results DOM's href attributes are far more stable
-        across LinkedIn frontend changes than its internal search endpoint
-        schema — the same tradeoff documented for `fetch_profile_view`,
-        just resolved the other way here.
+        The search endpoint/query-parameter shape below is the highest-
+        uncertainty part of this codebase: unlike `profileView` (verified
+        against a real response during development), LinkedIn's internal
+        search API was not confirmed live — see README Known Limitations.
+        To reduce that fragility, the result is extracted by regex-scanning
+        the raw response text for any `/in/<public-id>` occurrence rather
+        than parsing a specific JSON shape — a public identifier tends to
+        appear as a string value somewhere in the payload even if the
+        surrounding structure has drifted from what's assumed here.
         """
         if not company and not email:
             raise ValueError("Provide company or email to disambiguate the search.")
         if not self._settings.is_configured:
             raise LinkedInAuthError("LI_AT_COOKIE is not configured on the server.")
 
-        query = " ".join(part for part in [full_name, company or email] if part)
-        search_url = "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(query)
-
         await self._daily_budget.consume()
         await self._rate_limiter.wait_turn()
-        await self._ensure_browser()
+        session = await self._ensure_session()
 
-        context = await self._new_stealth_context()
-        page = await context.new_page()
-
-        # Shared deadline across both steps — see the matching comment in
-        # fetch_profile_view for why two independent full-timeout steps is
-        # a bug, not just belt-and-suspenders.
-        deadline = time.monotonic() + self._settings.request_timeout_seconds
+        keywords = " ".join(part for part in [full_name, company or email] if part)
+        query = (
+            f"(keywords:{urllib.parse.quote(keywords)},"
+            "flagshipSearchIntent:SEARCH_SRP,"
+            "queryParameters:(resultType:List(PEOPLE)),"
+            "includeFiltersInResponse:false)"
+        )
+        url = f"{_SEARCH_URL}?q=all&query={urllib.parse.quote(query, safe='(),:')}"
+        referer = "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(keywords)
 
         try:
-            await self._goto_or_raise_bot_detected(page, search_url, _remaining_ms(deadline))
-
-            try:
-                await page.wait_for_selector('a[href*="/in/"]', timeout=_remaining_ms(deadline))
-            except PlaywrightError:
-                if any(marker in page.url for marker in _LOGIN_WALL_MARKERS):
-                    raise LinkedInAuthError(
-                        "LinkedIn redirected to a login/checkpoint page — "
-                        "the li_at cookie is invalid, expired, or the account hit a security check."
-                    )
-                raise LinkedInSearchNoMatch(query)
-
-            hrefs: List[str] = await page.eval_on_selector_all(
-                'a[href*="/in/"]', "els => els.map(e => e.href)"
+            response = await session.get(
+                url, headers=self._voyager_headers(session, referer), allow_redirects=False
             )
-        finally:
-            await page.close()
-            await context.close()
+        except RequestsError as exc:
+            raise LinkedInRequestTimeout(str(exc)) from exc
 
-        for href in hrefs:
-            try:
-                public_id = extract_public_identifier(href)
-            except ValueError:
-                continue
+        if response.status_code in _REDIRECT_STATUSES:
+            self._raise_for_redirect(url, response.headers.get("location", ""))
+        if response.status_code in (401, 403):
+            raise LinkedInAuthError("LinkedIn rejected the session (expired, invalid, or challenged).")
+        if response.status_code == 429:
+            raise LinkedInRateLimited("LinkedIn responded with 429 Too Many Requests.")
+        if response.status_code != 200:
+            raise LinkedInSearchNoMatch(keywords)
+
+        for public_id in _SEARCH_RESULT_PUBLIC_ID_RE.findall(response.text):
             return f"https://www.linkedin.com/in/{public_id}/"
 
-        raise LinkedInSearchNoMatch(query)
+        raise LinkedInSearchNoMatch(keywords)

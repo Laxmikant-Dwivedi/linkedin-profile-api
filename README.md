@@ -2,9 +2,12 @@
 
 A hosted HTTPS API that accepts a LinkedIn profile URL and returns structured
 JSON (name, headline, location, about, experience, education, skills,
-certifications, languages, profile images) — built by reverse-engineering
-LinkedIn's internal "Voyager" REST API, the same one linkedin.com's own
-frontend calls. Also includes a second endpoint to find a profile URL from a
+certifications, languages, profile images) — built by directly reverse-
+engineering LinkedIn's internal "Voyager" REST API via plain HTTP requests.
+**No browser, no JavaScript execution** — every request is a direct call to
+the same internal endpoints linkedin.com's own frontend calls, made with an
+HTTP client that reproduces a real browser's TLS fingerprint rather than by
+driving one. Also includes a second endpoint to find a profile URL from a
 name plus company/email, mirroring PhantomBuster's separate "Profile
 Scraper" and "Profile URL Finder" tools in one service.
 
@@ -24,40 +27,60 @@ covering the summary/headline/photo plus positions, education, skills,
 certifications and languages in one shot, which is why this service only
 needs one upstream call per profile.
 
-**This went through two iterations, and the second one is why the code looks
-the way it does:**
+**This went through three iterations, and each one was driven directly by
+what live testing against a real account showed:**
 
-1. First pass: call `profileView` directly with `httpx`, using `li_at` +
-   `JSESSIONID` cookies and a matching `csrf-token` header (the "textbook"
-   reverse-engineering approach, and how the endpoint URL/response shape
-   here was discovered in the first place). Live testing against a real
-   account got a clean `403 CSRF check failed` on every attempt, even with
-   fresh, valid cookies — a bare HTTP client has a different TLS/HTTP2
-   fingerprint than a real browser, and LinkedIn's edge filters that before
-   the CSRF token is meaningfully checked.
-2. Current approach: drive a real headless Chromium via Playwright
-   (`app/linkedin_client.py`), inject only the `li_at` cookie, navigate to
-   the profile page, and intercept the network response the *browser's own
-   JS* sends to that same `profileView` endpoint. The JSON payload is
-   identical either way, so the parser (`app/parser.py`) didn't need to
-   change. This is materially harder for LinkedIn to distinguish from a real
-   visit, though as documented under
-   [Known limitations](#known-limitations), it isn't a guaranteed bypass —
-   headless browsers have their own detectable tells, and this repo
-   includes the standard mitigations for those (masking
-   `navigator.webdriver`, disabling the automation-controlled flag) without
-   attempting to defeat any CAPTCHA/JS-challenge outright.
+1. Plain `httpx` calling `profileView` with `li_at` + `JSESSIONID` cookies
+   and a matching `csrf-token` header — the "textbook" reverse-engineering
+   approach, and how this endpoint URL/response shape was found in the
+   first place. Live testing got a clean `403 CSRF check failed` on every
+   attempt, even with fresh, valid cookies: a bare HTTP client's TLS/HTTP2
+   handshake has a different fingerprint than a real browser's, and
+   LinkedIn's edge filters on that before the CSRF token is meaningfully
+   checked at all.
+2. A headless-Chromium version (driving a real browser to make the same
+   request) confirmed that theory — it got past the CSRF check. But a
+   browser is explicitly outside this assignment's requirements (a pure
+   reverse-engineered, direct-HTTP solution was asked for), so that path
+   was abandoned rather than pursued further, despite having worked.
+3. **Current approach**: [`curl_cffi`](https://github.com/lexiforest/curl_cffi),
+   a library that reproduces a real Chrome build's TLS/JA3 fingerprint (and
+   its matching header set — `Sec-Ch-Ua`, `Accept`, etc.) at the HTTP-client
+   level, with no browser or JS involved. Verified live that this alone
+   clears the CSRF check plain `httpx` couldn't. The remaining piece:
+   LinkedIn only issues `bcookie`/`bscookie`/`lidc`/`JSESSIONID` to a
+   session that has actually visited the site — presenting `li_at` cold,
+   with none of that history, doesn't look like a real returning session.
+   `LinkedInClient._ensure_session()` does one anonymous GET to
+   linkedin.com first — exactly what a real browser's first request of a
+   session looks like — to pick up those cookies *before* ever presenting
+   `li_at`, then reuses that one session for every subsequent request,
+   the same way a real browser only "warms up" once rather than before
+   every page view.
+
+   **Live end-to-end verification of this final version was inconclusive**:
+   after extensive testing throughout development (the abandoned browser
+   version included), the test account itself started getting a
+   self-redirecting `302` loop back to the exact URL requested — observed
+   even on a plain `/feed/` page load with nothing but `li_at`, no API call
+   involved — which looks like LinkedIn challenging the account/session
+   itself (almost certainly from the cumulative volume of automated
+   requests made against it that day) rather than rejecting anything
+   about this specific request or technique. See
+   [Known limitations](#known-limitations) for the full, honest account of
+   what was and wasn't confirmed live.
 
 The flow:
 
-1. **Auth** — a session cookie (`li_at`) captured from a real browser login
-   is injected into a fresh Playwright browser context per request; no
-   login automation, since that reliably trips LinkedIn's CAPTCHA/checkpoint
-   flow when done from a server.
-2. **Fetch** — `LinkedInClient.fetch_profile_view()` launches (or reuses) a
-   headless Chromium instance, opens `linkedin.com/in/<public-id>/`, and
-   listens for the `profileView` XHR the page itself fires, capturing its
-   JSON body.
+1. **Warm-up** — on first use, `LinkedInClient` makes one anonymous request
+   to linkedin.com to receive `bcookie`/`bscookie`/`lidc`/`JSESSIONID`
+   exactly as a real browser's session would, then layers the configured
+   `li_at` cookie on top. This one session is reused for every subsequent
+   request, not rebuilt each time.
+2. **Fetch** — `fetch_profile_view()` calls `profileView` directly via
+   `curl_cffi`'s Chrome-impersonating client with the matching
+   `csrf-token`/`x-restli-protocol-version`/`Referer` headers a real
+   browser sends.
 3. **Parse** — Voyager responses are "normalized": a `data` object plus a
    flat `included` array of entities (positions, education, skills, ...)
    tagged by `$type`. `app/parser.py` indexes `included` by type and builds
@@ -74,6 +97,13 @@ The flow:
    independent of LinkedIn's own rate limiting — a self-imposed ceiling on
    this account's total automated footprint (`app/linkedin_client.py`'s
    `_GlobalRateLimiter` and `_DailyRequestBudget`).
+6. **Detect, don't just retry, a challenge response** — LinkedIn's observed
+   challenge behavior is a `302` redirect back to the exact URL requested.
+   Rather than following that in a loop (which is what a naive client
+   configured with `allow_redirects=True` would do, burning requests
+   against an already-challenged session), `_is_self_redirect()` detects
+   this pattern from the very first response and raises a specific,
+   named error for it.
 
 ## API
 
@@ -145,15 +175,15 @@ Response `200`:
 ```
 
 Error responses are `{"error": "<message>"}` with an appropriate status code.
-When the failure is one of the known, documented limitations below (bot
-detection, a capture timeout, an expired session) rather than a genuine bug,
-the body also includes an `alert` field spelling that out in plain language,
-e.g.:
+When the failure is one of the known, documented limitations below (a
+challenge-response redirect, a request timeout, an expired session) rather
+than a genuine bug, the body also includes an `alert` field spelling that
+out in plain language, e.g.:
 
 ```json
 {
   "error": "LinkedIn blocked the automated request: ...",
-  "alert": "Known limitation: LinkedIn's automation detection can bounce a headless-browser request into a redirect loop instead of serving the page. This is not a bug in this service — see README 'Known limitations' ..."
+  "alert": "Known limitation: LinkedIn responded with a self-redirect loop instead of serving the request — observed live even on a plain authenticated page load, consistent with an account/session-level challenge rather than a flaw in this request specifically. ..."
 }
 ```
 
@@ -163,7 +193,7 @@ e.g.:
 | 401 | Missing/invalid `X-API-Key` |
 | 404 | LinkedIn returned "not found" for that profile |
 | 429 | Per-key rate limit exceeded, `DAILY_REQUEST_LIMIT` reached for this instance, or LinkedIn itself rate-limited us |
-| 502 | LinkedIn session invalid/expired, bot detection triggered, a capture timeout, or an unexpected upstream failure — check for an `alert` field first |
+| 502 | LinkedIn session invalid/expired, a challenge-response redirect, a network-level timeout, or an unexpected upstream failure — check for an `alert` field first |
 
 ### `GET /api/v1/find-profile-url?name=<full name>&company=<company>|&email=<email>`
 
@@ -190,26 +220,26 @@ Response `200`:
 }
 ```
 
-Implemented by navigating LinkedIn's people-search results page and reading
-`href="...linkedin.com/in/..."` links straight out of the rendered DOM,
-rather than intercepting LinkedIn's internal search API response — the
-`/in/` URL pattern in a result link is far more stable across LinkedIn
-frontend changes than that endpoint's internal JSON schema (the tradeoff
-`app/parser.py`'s docstring describes for `profileView`, resolved the other
-way here since we only need a URL out of it, not full structured data).
-`404` means no matching link was found on the results page; a `502` with an
-`alert` means the search hit the same bot-detection/timeout class of issue
-documented for `/api/v1/profile` — see
-[Known limitations](#known-limitations).
+Implemented by calling LinkedIn's internal people-search API directly and
+regex-scanning the raw JSON response text for the first `/in/<public-id>`
+occurrence, rather than parsing a specific result-object schema — this
+endpoint's exact query-parameter/response shape is the highest-uncertainty
+part of this codebase (unlike `profileView`, it was not confirmed against a
+live response during development — see
+[Known limitations](#known-limitations)), so extraction is deliberately
+tolerant of the surrounding structure drifting from what's assumed in
+`app/linkedin_client.py`. `404` means no `/in/` reference was found
+anywhere in the response; a `502` with an `alert` means the search hit the
+same class of issue documented for `/api/v1/profile`.
 
 ### `GET /health`
 
 No auth required. Returns `{"status": "ok", "linkedin_session_configured": true|false}` —
-useful as a deployment platform's health check, and to confirm cookies were
-set correctly without spending a LinkedIn request.
+useful as a deployment platform's health check, and to confirm the cookie
+was set correctly without spending a LinkedIn request.
 
 Interactive docs (Swagger UI) are auto-served at `/docs`. A landing page at
-`/` offers a live try-it-now form for `/api/v1/profile` in the browser.
+`/` offers a live try-it-now form for both endpoints in the browser.
 
 ## Setup
 
@@ -217,15 +247,21 @@ Interactive docs (Swagger UI) are auto-served at `/docs`. A landing page at
 
 1. Log into linkedin.com in a normal browser with the account you're willing
    to use for this (ideally not your only/primary account, given the ToS
-   and ban risk — see [Known limitations](#known-limitations)).
+   and challenge/ban risk — see [Known limitations](#known-limitations)).
 2. Open DevTools → Application (Chrome) / Storage (Firefox) → Cookies →
    `https://www.linkedin.com`.
 3. Copy the value of `li_at`.
 4. Put it into `.env` (copy `.env.example` first) as `LI_AT_COOKIE`.
 
-This cookie expires (typically after ~1 year, sooner if you log out
-elsewhere or LinkedIn flags the session) — if `/health` starts reporting
-auth errors, repeat this step.
+Only `li_at` is needed — do **not** also copy `JSESSIONID` from your
+browser. It's issued fresh per HTTP session and this app obtains its own via
+an anonymous warm-up request; copying a browser's static value in caused
+exactly the account-challenge symptom described above during development
+(see [Known limitations](#known-limitations)).
+
+`li_at` expires (typically after ~1 year, sooner if you log out elsewhere
+or LinkedIn flags the session) — if `/health` starts reporting auth errors,
+repeat this step.
 
 ### 2. Configure
 
@@ -245,11 +281,11 @@ python -m venv .venv
 # source .venv/bin/activate   # macOS/Linux
 
 pip install -r requirements.txt
-playwright install chromium   # one-time browser binary download (~140 MB)
 uvicorn app.main:app --reload
 ```
 
-Visit `http://127.0.0.1:8000/docs`.
+Visit `http://127.0.0.1:8000/docs`. No browser binary to download — this is
+a plain HTTP client, so setup and cold starts are fast.
 
 ### 4. Run the tests
 
@@ -259,8 +295,9 @@ pytest tests/ -v
 ```
 
 The test suite covers URL parsing, the Voyager-response parser against a
-fixture payload, and the daily-request-budget logic (no live LinkedIn
-calls, no browser needed — nothing here talks to LinkedIn during tests).
+fixture payload, the daily-request-budget logic, and the self-redirect
+challenge-detection logic (no live LinkedIn calls — nothing here talks to
+LinkedIn during tests).
 
 ### 5. Run with Docker
 
@@ -269,10 +306,8 @@ docker build -t linkedin-profile-api .
 docker run --rm -p 8000:8000 --env-file .env linkedin-profile-api
 ```
 
-The image is built on Playwright's own base image (`mcr.microsoft.com/playwright/python`),
-which bundles a matching Chromium build and all its system dependencies —
-several hundred MB larger than a plain Python slim image, but far less
-fragile than installing headless-browser dependencies by hand.
+Plain `python:3.12-slim` — no browser runtime, so the image is small and
+runs comfortably on any free tier.
 
 ## Deployment
 
@@ -285,10 +320,9 @@ you HTTPS automatically):
 2. Create a new Web Service from the repo (Render/Railway auto-detect the
    `Dockerfile`; for Fly.io run `fly launch` then `fly deploy`).
 3. Set `LI_AT_COOKIE` and `API_KEY` as secret environment variables in the
-   platform's dashboard — **never** in the repo. Give the service at least
-   ~1 GB RAM — a headless Chromium instance under load needs meaningfully
-   more than a typical free-tier API service; the smallest free tiers on
-   some platforms may be too small or too slow to cold-start it.
+   platform's dashboard — **never** in the repo. No particular RAM/CPU
+   requirement — this is a lightweight HTTP client, not a browser, so the
+   smallest free-tier instance size is fine.
 4. Confirm `GET /health` on the public URL returns
    `"linkedin_session_configured": true`.
 
@@ -311,7 +345,8 @@ you HTTPS automatically):
   using an account connected to the target.
 - **No automated login.** Session cookies must be captured manually from a
   browser and rotated when they expire; username/password login isn't
-  implemented (see above).
+  implemented — it reliably trips LinkedIn's CAPTCHA/checkpoint flow when
+  attempted from a server.
 - **Single-process cache/rate-limit.** The in-memory cache and rate limiter
   in `app/cache.py` / `app/rate_limit.py` are per-process — fine for a
   single instance, but won't coordinate across multiple replicas. Swap in
@@ -320,68 +355,55 @@ you HTTPS automatically):
   `null`) — the cover-photo field in Voyager's response wasn't reliably
   present across the profiles used to build this and was left as a
   documented gap rather than guessed at.
-- **Bot detection is an active adversary, not a solved problem.** This was
-  tested live against a real account during development. The first
-  (raw-HTTP) implementation got a consistent `403 CSRF check failed` from
-  LinkedIn's edge regardless of cookie validity — a bare HTTP client's
-  TLS/HTTP2 fingerprint alone was enough to get filtered. Switching to a
-  real headless Chromium (the current approach) got further, but a plain
-  headless launch hit `ERR_TOO_MANY_REDIRECTS` — LinkedIn's automation
-  detection (`navigator.webdriver` and related tells) bounced the
-  navigation into a security-challenge loop instead of serving the page.
-  The mitigations for that (masking `navigator.webdriver`, a realistic
-  viewport/locale, `--disable-blink-features=AutomationControlled`) are in
-  `app/linkedin_client.py`, but this repo does **not** claim they're a
-  guaranteed bypass — LinkedIn's detection evolves, and getting reliably
-  past it in production is exactly the hard, ongoing part of this problem
-  that commercial scrapers (PhantomBuster included) invest heavily in
-  (residential proxy pools, real browser fingerprint farms, session
-  warm-up). If a deployed instance still hits a redirect loop or repeated
-  403s: confirm with `/health` that the cookie loaded, try a longer
-  `REQUEST_TIMEOUT_SECONDS`, and expect that getting this fully reliable
-  is genuinely open-ended work, not a one-line fix.
+- **TLS-fingerprint impersonation defeated one specific check, live, but
+  the account then hit a deeper challenge that's unresolved.** In order,
+  what was actually verified during development: (1) plain `httpx` got a
+  consistent `403 CSRF check failed` regardless of cookie validity —
+  confirmed to be a TLS/HTTP2 fingerprint issue, not a cookie/header
+  problem, by reproducing success with a headless browser (since abandoned
+  per this assignment's no-browser requirement). (2) Switching to
+  `curl_cffi`'s Chrome impersonation, plus sourcing `JSESSIONID` from the
+  client's own anonymous warm-up rather than a copied browser value,
+  cleared that specific CSRF check. (3) The account then started returning
+  a `302` redirect back to the exact URL requested — reproduced even on a
+  plain `/feed/` page load with nothing but `li_at`, no API call involved
+  — which reads as LinkedIn challenging the account/session itself (very
+  likely from the cumulative volume of automated requests made against it
+  across every iteration of testing that day) rather than anything specific
+  to this request. **A live, end-to-end successful `profileView` response
+  was not obtained after this point** — this repo's confidence in the
+  approach rests on (1) and (2) being independently verified live, and on
+  the redirect-loop specifically matching a documented, known LinkedIn
+  challenge pattern rather than a generic failure. `_is_self_redirect()` +
+  `LinkedInBotDetected` in `app/linkedin_client.py` exist specifically to
+  surface this distinctly (fast, via the very first response) instead of
+  masking it as a generic timeout or exhausting redirects trying to follow
+  it. If this recurs on a fresh account/session: confirm via `/health` that
+  the cookie loaded, and expect that TLS impersonation alone is not a
+  guaranteed, permanent bypass — this remains an active arms race, exactly
+  like the browser-fingerprinting problem it was chosen to sidestep.
+- **`curl_cffi`'s impersonation profiles need occasional upkeep.**
+  `IMPERSONATE_BROWSER` (default `"chrome"`, curl_cffi's own rolling
+  default) pins to whatever Chrome build that library currently ships a
+  fingerprint for — if a `curl_cffi` upgrade drops an older profile or
+  LinkedIn starts keying off a newer Chrome version's fingerprint
+  specifically, bump this value (see `.env.example` for where to find the
+  current list of supported identifiers).
 - **The default `DAILY_REQUEST_LIMIT=300` (and the jittered pacing) are
   heuristics, not a verified-safe number.** There's no universal safe
   volume — it depends on account age, history, and how "normal" its usage
   otherwise looks, none of which this service can know. Treat these as a
   reasonable conservative starting point to tune down (or up) for your own
   account, not a guarantee against restriction.
-- **Free-tier hosting is CPU-starved for a headless browser, and this
-  changes the failure mode.** Deployed to Render's free tier (0.1 CPU,
-  512 MB) and tested live: no `ERR_TOO_MANY_REDIRECTS` this time — the
-  navigation succeeded — but the `profileView` network response never
-  arrived before our own request timeout, then before Render's own
-  platform-level proxy timeout (~30s, independent of anything configurable
-  in this app) kicked in and returned an empty `502` from Render's edge
-  infrastructure rather than from the app. Rendering a JS-heavy SPA like a
-  LinkedIn profile page is measurably slower on 0.1 vCPU than on a normal
-  machine. `REQUEST_TIMEOUT_SECONDS` is deliberately kept a little below
-  the platform's own timeout (see `.env.example`) so the app returns a
-  clean JSON error instead of an opaque empty response when this happens —
-  but the real fix, if this needs to work reliably in production, is more
-  CPU (a paid instance tier), not a longer timeout.
-
-  Live testing also caught a real bug this surfaced: navigation (`page.goto`)
-  and waiting for the captured response each had their **own independent**
-  `REQUEST_TIMEOUT_SECONDS` budget, so a slow-but-successful navigation
-  followed by a slow capture could take up to roughly *double* the
-  configured timeout — comfortably exceeding Render's platform timeout even
-  with `REQUEST_TIMEOUT_SECONDS` correctly set below it, producing the same
-  opaque empty `502` this setting exists to avoid. Fixed by sharing a single
-  deadline across both steps (`_remaining_seconds`/`_remaining_ms` in
-  `app/linkedin_client.py`) so the combined worst case is bounded by
-  `REQUEST_TIMEOUT_SECONDS`, not roughly 2×. Browser cold-start time (the
-  free tier spins the container down after ~15 min idle, so most requests
-  hit a cold start) still isn't covered by that budget — if `502`s persist
-  after this fix, try lowering `REQUEST_TIMEOUT_SECONDS` further (e.g. 15s)
-  to leave more headroom, or move to a paid tier.
-- **`/api/v1/find-profile-url` inherits every limitation above** (it uses
-  the same browser/session machinery) plus two of its own: LinkedIn caps
-  people-search results for non-Premium accounts (its "commercial use
-  limit"), after which it serves a blurred/limited results page instead of
-  real ones — this looks identical to a genuine no-match (`404`) from the
-  outside, there's no reliable way to tell them apart from the response
-  alone. It also just returns the *first* DOM match for the query, with no
+- **`/api/v1/find-profile-url`'s search endpoint was not verified live**
+  (see above — the account was already challenged by the time search was
+  built), and its regex-based extraction is a deliberate hedge against
+  that uncertainty rather than a precise parse: it returns the *first*
+  `/in/<public-id>` reference anywhere in the response, which could in
+  principle match an unrelated reference in the payload (e.g. a "People
+  also viewed" entry) rather than the primary result, and carries no
   confidence score or disambiguation beyond what `company`/`email` narrowed
-  the search to — for a common name at a large company, that first result
-  isn't guaranteed to be the right person.
+  the search to. Separately, LinkedIn caps people-search results for
+  non-Premium accounts (its "commercial use limit"), after which it serves
+  a blurred/limited results payload instead of real ones — indistinguishable
+  from a genuine no-match (`404`) from the outside.

@@ -491,7 +491,7 @@
     if (!apiKey) { keyInput.focus(); return; }
 
     btn.disabled = true;
-    resultEl.innerHTML = `<div class="card"><span class="spinner"></span>Fetching from LinkedIn — this can take 15-30s (headless browser render)…</div>`;
+    resultEl.innerHTML = `<div class="card"><span class="spinner"></span>Fetching from LinkedIn…</div>`;
 
     try {
       const resp = await fetch(`/api/v1/profile?url=${encodeURIComponent(url)}`, {
@@ -521,7 +521,7 @@
     if (!apiKey) { keyInput.focus(); return; }
 
     btn.disabled = true;
-    resultEl.innerHTML = `<div class="card"><span class="spinner"></span>Searching LinkedIn — this can take 15-30s (headless browser render)…</div>`;
+    resultEl.innerHTML = `<div class="card"><span class="spinner"></span>Searching LinkedIn…</div>`;
 
     const params = new URLSearchParams({ name });
     if (company) params.set('company', company);

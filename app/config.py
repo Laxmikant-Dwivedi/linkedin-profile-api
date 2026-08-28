@@ -14,10 +14,19 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # LinkedIn session — obtained by logging into linkedin.com in a real
-    # browser and copying the `li_at` cookie. See README. A headless
-    # browser drives the actual scrape, so no CSRF/JSESSIONID handling is
-    # needed here — the browser establishes its own session.
+    # browser and copying the `li_at` cookie. See README. JSESSIONID is
+    # deliberately NOT configured here: it's issued fresh per HTTP session
+    # by LinkedIn itself and must come from this client's own anonymous
+    # warm-up request, not be copied from a browser — see
+    # `LinkedInClient._ensure_session()`.
     li_at_cookie: str = ""
+
+    # Which browser's TLS/JA3 + header fingerprint curl_cffi impersonates.
+    # See https://github.com/lexiforest/curl_cffi for the current list of
+    # supported values (e.g. "chrome124", "chrome131", or the bare "chrome"
+    # alias for curl_cffi's current default) — bump this if the pinned
+    # version stops matching what LinkedIn's edge currently accepts.
+    impersonate_browser: str = "chrome"
 
     # API key clients must send in the `X-API-Key` header. Required so this
     # publicly hosted service can't be used by strangers to drain the
@@ -42,13 +51,11 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 3600
     cache_max_size: int = 512
 
-    # Outbound request timeout to LinkedIn.
-    request_timeout_seconds: float = 20.0
-
-    user_agent: str = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
+    # Timeout for each direct HTTP request to LinkedIn. Lightweight (no
+    # browser rendering involved), so mainly a safety net against a hung
+    # connection rather than something to tune around a hosting platform's
+    # proxy timeout.
+    request_timeout_seconds: float = 15.0
 
     @property
     def is_configured(self) -> bool:
